@@ -1,3 +1,5 @@
-/Experiment/1_hTERT_HME1/Data
-/Experiment/1_hTERT_HME1/Results
+/Experiment/1_hTERT_HME1/Data/*
+/Experiment/1_hTERT_HME1/Results/Interesting_proteins/*
+/Experiment/1_hTERT_HME1/Results/Sub_datasets/*
 /External_Data
+/Experiment/1_hTERT_HME1/1_hTERT_HME1_Report.md
