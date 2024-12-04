@@ -4,12 +4,13 @@ import matplotlib.pyplot as plt
 import os
 import re
 import warnings
-
+# THIS FUNCTIONS ARE NOT BEING REDEFINED WHEN IMPORTING IN THE MAIN PLOTTING SCREEN , THIS IS WHY I PUT THEM BACK IN THE PLOTTING JUPYTER NOTEBOOK
 # Plotting functions
 def plot_protein_phosphosites_together(df, proteins=list, legend=list, path=str, saving_path=str,
                                        saving_info="", save_pdf=False, save_png=False, plot_close=False,
                                        fit_y_lims=False):
     '''Plot to PDF ALL phosphosites of a protein together in one single plot. "y" limits are ajusted to the limits of each phosphosites'''
+
     for protein in proteins:
 
         # Create sub-dataframe with only the protein we are interested in. If the protein doesn't exist in the dataframe skip code
@@ -27,8 +28,8 @@ def plot_protein_phosphosites_together(df, proteins=list, legend=list, path=str,
         if protein in os.listdir(to_save):
             pass
         else:
-            path = f"{to_save}/{protein}"
-            os.makedirs(path)
+            new_path = f"{to_save}/{protein}"
+            os.makedirs(new_path)
 
         sub_df.sort_values(by=['site'], inplace=True)
 
@@ -168,8 +169,8 @@ def plot_protein_phosphosites_individually(df, proteins=list, legend=list, path=
         if protein in os.listdir(to_save):
             pass
         else:
-            path = f"{to_save}/{protein}"
-            os.makedirs(path)
+            new_path = f"{to_save}/{protein}"
+            os.makedirs(new_path)
 
         for row in sub_df.itertuples():
             # HERE THE ROW IS TAKEN OUT OF THE SUBDATAFRAME.
@@ -242,8 +243,8 @@ def plot_dataset_phosphosites_together(df, proteins=list, legend=list, path=str,
     if dataset_name in os.listdir(to_save):
         pass
     else:
-        path = f"{to_save}/{dataset_name}"
-        os.makedirs(path)
+        new_path = f"{to_save}/{dataset_name}"
+        os.makedirs(new_path)
 
     # Geting some basic information and parameters for the plots
     number_phos = len(df)
@@ -344,3 +345,8 @@ def plot_dataset_phosphosites_together(df, proteins=list, legend=list, path=str,
         print(f"{dataset_name} Plot saved as PNG")
     if plot_close == True:
         plt.close()
+
+
+
+def test(hola):
+    print(hola)
