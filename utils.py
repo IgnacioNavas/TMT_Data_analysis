@@ -6,6 +6,8 @@ import re
 import warnings
 # THIS FUNCTIONS ARE NOT BEING REDEFINED WHEN IMPORTING IN THE MAIN PLOTTING SCREEN , THIS IS WHY I PUT THEM BACK IN THE PLOTTING JUPYTER NOTEBOOK
 # Plotting functions
+
+# %%
 def plot_protein_phosphosites_together(df, proteins=list, legend=list, path=str, saving_path=str,
                                        saving_info="", save_pdf=False, save_png=False, plot_close=False,
                                        fit_y_lims=False):
@@ -146,7 +148,7 @@ def plot_protein_phosphosites_together(df, proteins=list, legend=list, path=str,
         if plot_close == True:
             plt.close()
 
-
+# %%
 def plot_protein_phosphosites_individually(df, proteins=list, legend=list, path=str, saving_path=str,
                                            saving_info="", save_pdf=False, save_png=False, plot_close=False,
                                            fit_y_lims=True):
@@ -231,7 +233,7 @@ def plot_protein_phosphosites_individually(df, proteins=list, legend=list, path=
             if plot_close == True:
                 plt.close()
 
-
+# %%
 def plot_dataset_phosphosites_together(df, proteins=list, legend=list, path=str, saving_path=str, dataset_folder=str,
                                        dataset_name=str,
                                        saving_info="", save_pdf=False, save_png=False, plot_close=False,
@@ -347,6 +349,7 @@ def plot_dataset_phosphosites_together(df, proteins=list, legend=list, path=str,
         plt.close()
 
 
-
+# %%
 def test(hola):
     print(hola)
+    print(len(hola), hola)
