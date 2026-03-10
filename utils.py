@@ -1038,12 +1038,15 @@ def tslearn_clustering_KShape(df_to_cluster,
                               exclude_full = False,
                               number_of_clusters = int,
                               cluster_column_name = str,
+                              n_init = 5,
                               max_iterations = 1000,
                               # metric='euclidean',
                               df_dimensions = int,
                               time_series_length = int,
+                              random_state = 0,
                               transpose = False,
-                              verbose = True ):
+                              verbose = True,
+                              testing = False):
 
     column_names = df_to_cluster.columns.tolist()
     if len(condition_for_clustering) == 0:
@@ -1059,13 +1062,17 @@ def tslearn_clustering_KShape(df_to_cluster,
 
     multivariate_df, names_of_myseries = reshape_df(df = df_to_cluster, time_series = column_selection, dimensions = df_dimensions, len_time_serie = time_series_length, transpose=transpose, labels = "site",verbose=verbose)
 
-    print(f"\nThe size of the dataset is {multivariate_df.shape}")
+    if verbose == True:
+        print(f"\nThe size of the dataset is {multivariate_df.shape}")
 
-    clustering = KShape(n_clusters=number_of_clusters, max_iter=max_iterations, n_init = 10, verbose=verbose, random_state=0).fit(multivariate_df)
+    clustering = KShape(n_clusters=number_of_clusters, max_iter=max_iterations, n_init = n_init, verbose=verbose, random_state=random_state).fit(multivariate_df)
 
     df_to_cluster[f"{cluster_column_name}"] = clustering.labels_
 
-    return df_to_cluster
+    if testing == True:
+        return df_to_cluster, clustering, multivariate_df
+    else:
+        return df_to_cluster
 
 #%%
 def build_graph_from_edges(df, source_col="node1", target_col="node2", directed=True):
@@ -1533,7 +1540,7 @@ def clusters_shared_peptides(
     plt.show()
 
 #%%
-def kernnel_clustering(df,
+def kernnel_clustering(df_to_cluster,
                        transpose = True,
                        data_type = "log2_FC",
                        exclude_full = True,
@@ -1546,10 +1553,11 @@ def kernnel_clustering(df,
                        verbose = True,
                        kernel = "gak",
                        kernel_params={"sigma": "auto"},
-                       cluster_column_name = ""
+                       cluster_column_name = "",
+                       testing = False
                        ):
 
-    column_names = df.columns.tolist()
+    column_names = df_to_cluster.columns.tolist()
     if len(condition_for_clustering) == 0:
         column_selection = [element for element in column_names if element.startswith(f"{data_type}")] #f"{data_type}" in element]
         if exclude_full == True:
@@ -1561,23 +1569,21 @@ def kernnel_clustering(df,
     if verbose == True:
         print(f"Column selection: {column_selection}\n")
 
-    X, y = reshape_df(df=df, time_series=column_selection, labels="site", dimensions = df_dimensions, len_time_serie = time_series_length,  transpose= transpose,verbose=verbose)
+    multivariate_df, names_of_myseries = reshape_df(df=df_to_cluster, time_series=column_selection, labels="site", dimensions = df_dimensions, len_time_serie = time_series_length,  transpose= transpose,verbose=verbose)
 
     if verbose == True:
-        print(f"\nThe size of the dataset is {X.shape}")
-        print(f"Example:\n{X[0]}")
+        print(f"\nThe size of the dataset is {multivariate_df.shape}")
+        print(f"Example:\n{multivariate_df[0]}")
 
-    gak_km = KernelKMeans(n_clusters=n_clusters,
-                          kernel=kernel,
-                          kernel_params=kernel_params,
-                          n_init=n_init,
-                          verbose=verbose,
-                          random_state=seed)
+    clustering_gak_km = KernelKMeans(n_clusters=n_clusters, kernel=kernel, kernel_params=kernel_params, n_init=n_init, verbose=verbose, random_state=seed).fit(multivariate_df)
 
-    clusters_predicted = gak_km.fit_predict(X)
-    df[f"{cluster_column_name}"] = clusters_predicted
+    # clusters_predicted = clustering_gak_km.fit_predict(multivariate_df)
+    df_to_cluster[f"{cluster_column_name}"] = clustering_gak_km.labels_ #clusters_predicted
 
-    return df
+    if testing == True:
+            return df_to_cluster, clustering_gak_km, multivariate_df
+    else:
+        return df_to_cluster
 
 #%%
 def cluster_similarity_cdist_dtw(

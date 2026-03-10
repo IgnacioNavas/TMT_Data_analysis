@@ -55,7 +55,8 @@ from utils import (
     filter_replicates,
     filter_site_localizations,
     filter_dynamics_extremes,
-    tslearn_clustering_KMeans,
+    # tslearn_clustering_KMeans,
+    kernnel_clustering,
 )
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,8 @@ GLOBAL_EXCLUDE_FULL  = None
 GLOBAL_N_SEEDS       = None
 GLOBAL_METRIC        = None
 GLOBAL_N_INIT        = None
-GLOBAL_MAX_ITER      = None
+# GLOBAL_MAX_ITER      = None
+GLOBAL_KERNEL_METRIC = None
 
 
 def worker_init(
@@ -87,7 +89,8 @@ def worker_init(
     metric: str,
     n_seeds: int,
     n_init: int,
-    max_iterations: int,
+    # max_iterations: int,
+    kernel_metric: str,
 ) -> None:
     """
     Run once per worker process (CPU/core) before any tasks are dispatched.
@@ -106,7 +109,7 @@ def worker_init(
     global GLOBAL_DF, GLOBAL_DATA_TYPE, GLOBAL_K_START, GLOBAL_K_END
     global GLOBAL_CONDITIONS, GLOBAL_TS_LENGTH, GLOBAL_TS_DIMENSIONS
     global GLOBAL_EXCLUDE_FULL, GLOBAL_METRIC, GLOBAL_N_SEEDS
-    global GLOBAL_N_INIT, GLOBAL_MAX_ITER
+    global GLOBAL_N_INIT, GLOBAL_KERNEL_METRIC #, GLOBAL_MAX_ITER
 
     GLOBAL_DF            = pd.read_pickle(filtered_pickle_path)
     GLOBAL_DATA_TYPE     = data_type
@@ -119,7 +122,8 @@ def worker_init(
     GLOBAL_METRIC        = metric
     GLOBAL_N_SEEDS       = n_seeds
     GLOBAL_N_INIT        = n_init
-    GLOBAL_MAX_ITER      = max_iterations
+    # GLOBAL_MAX_ITER      = max_iterations
+    GLOBAL_KERNEL_METRIC = kernel_metric
 
 
 # ---------------------------------------------------------------------------
@@ -152,23 +156,22 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
     print(f"[clustering pid={os.getpid()}] k={k} seed={seed}", flush=True)
 
     # GLOBAL_DF is already copy-on-write isolated in this process; no .copy() needed.
-    df_clustered, model, multivariate = tslearn_clustering_KMeans(
+    df_clustered, model, multivariate = kernnel_clustering(
         df_to_cluster=GLOBAL_DF,
+        transpose=True,
         data_type=GLOBAL_DATA_TYPE,
-        condition_for_clustering=GLOBAL_CONDITIONS,
         exclude_full=GLOBAL_EXCLUDE_FULL,
-        cluster_column_name=cluster_name,
-        number_of_clusters=k,
-        max_iterations=GLOBAL_MAX_ITER,
-        n_init=GLOBAL_N_INIT,
-        metric=GLOBAL_METRIC,
+        condition_for_clustering=GLOBAL_CONDITIONS,
         df_dimensions=GLOBAL_TS_DIMENSIONS,
         time_series_length=GLOBAL_TS_LENGTH,
-        random_state=seed,
-        transpose=True,
+        seed=seed,
+        n_clusters=k,
+        n_init=GLOBAL_N_INIT,
         verbose=False,
-        testing=True,
-        barycenter_calculations=False,
+        kernel=GLOBAL_KERNEL_METRIC,
+        kernel_params={"sigma":"auto"},
+        cluster_column_name=cluster_name,
+        testing=True
     )
 
     return {
@@ -294,9 +297,9 @@ def main() -> None:
     parser.add_argument("--n_init",           type=int,   default=5,
                         help="KMeans initialisations per run (default: 5). "
                              "Higher values give better convergence but are slower.")
-    parser.add_argument("--max_iterations",   type=int,   default=100,
-                        help="Max KMeans iterations per run (default: 100). "
-                             "Use 300 for final clustering runs, 100 is enough for QC sweeps.")
+    # parser.add_argument("--max_iterations",   type=int,   default=100,
+    #                     help="Max KMeans iterations per run (default: 100). "
+    #                          "Use 300 for final clustering runs, 100 is enough for QC sweeps.")
     parser.add_argument("--workers",          type=int,   default=6,
                         help="Worker processes for Stage 1 clustering (default: 6)")
     parser.add_argument("--metrics_workers",  type=int,   default=None,
@@ -310,6 +313,8 @@ def main() -> None:
     parser.add_argument("--sil_patience",     type=int,   default=5,
                         help="Consecutive k-values below --sil_min before silhouette is skipped "
                              "(default: 5). Only used if --sil_min is set.")
+    parser.add_argument("--kernel_metric", type=str, default="gak",
+                        help = "Kernel metric for clustering (default: gak)")
 
     args = parser.parse_args()
 
@@ -325,8 +330,8 @@ def main() -> None:
         f"Run config:\n"
         f"  data_type={args.data_type} | k={args.k_start}–{args.k_end}\n"
         f"  conditions={args.conditions} | ts_length={args.ts_length} | ts_dimensions={args.ts_dimensions}\n"
-        f"  exclude_full={args.exclude_full} | metric={args.metric}\n"
-        f"  n_seeds={args.n_seeds} | n_init={args.n_init} | max_iterations={args.max_iterations}\n"
+        f"  exclude_full={args.exclude_full} | metric={args.metric} | kernel_metric={args.kernel_metric}\n"
+        f"  n_seeds={args.n_seeds} | n_init={args.n_init}\n" # | max_iterations={args.max_iterations}\n"
         f"  workers={args.workers} | metrics_workers={metrics_workers}\n"
         f"  sil_min={args.sil_min} | sil_patience={args.sil_patience}\n"
     )
@@ -408,7 +413,8 @@ def main() -> None:
                 args.metric,
                 args.n_seeds,
                 args.n_init,
-                args.max_iterations,
+                # args.max_iterations,
+                args.kernel_metric,
             ),
         ) as executor:
             futures = {executor.submit(cluster_worker, t): t for t in all_tasks}
@@ -537,7 +543,7 @@ def main() -> None:
     k_list = list(ks)
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f"Kmeans Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Kernel Kmeans Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
 
     for metric_name, values, ylabel, subplot in [
         ("inertia",    inertias,    "Inertia",                       0),

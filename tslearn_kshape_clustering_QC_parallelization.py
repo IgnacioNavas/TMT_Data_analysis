@@ -26,7 +26,6 @@ CLI arguments:
   --ts_length         : time series length (default: 6)
   --ts_dimensions     : number of dimensions (default: 3)
   --exclude_full      : exclude full data (default: True)
-  --metric            : clustering distance metric (default: euclidean)
   --n_seeds           : number of seeds for stability (default: 10)
   --n_init            : KMeans initialisations per run (default: 5)
   --max_iterations    : max KMeans iterations (default: 100)
@@ -55,7 +54,7 @@ from utils import (
     filter_replicates,
     filter_site_localizations,
     filter_dynamics_extremes,
-    tslearn_clustering_KMeans,
+    tslearn_clustering_KShape,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,7 +69,6 @@ GLOBAL_TS_LENGTH     = None
 GLOBAL_TS_DIMENSIONS = None
 GLOBAL_EXCLUDE_FULL  = None
 GLOBAL_N_SEEDS       = None
-GLOBAL_METRIC        = None
 GLOBAL_N_INIT        = None
 GLOBAL_MAX_ITER      = None
 
@@ -84,7 +82,6 @@ def worker_init(
     ts_length: int,
     ts_dimensions: int,
     exclude_full: bool,
-    metric: str,
     n_seeds: int,
     n_init: int,
     max_iterations: int,
@@ -105,7 +102,7 @@ def worker_init(
 
     global GLOBAL_DF, GLOBAL_DATA_TYPE, GLOBAL_K_START, GLOBAL_K_END
     global GLOBAL_CONDITIONS, GLOBAL_TS_LENGTH, GLOBAL_TS_DIMENSIONS
-    global GLOBAL_EXCLUDE_FULL, GLOBAL_METRIC, GLOBAL_N_SEEDS
+    global GLOBAL_EXCLUDE_FULL, GLOBAL_N_SEEDS
     global GLOBAL_N_INIT, GLOBAL_MAX_ITER
 
     GLOBAL_DF            = pd.read_pickle(filtered_pickle_path)
@@ -116,7 +113,6 @@ def worker_init(
     GLOBAL_TS_LENGTH     = ts_length
     GLOBAL_TS_DIMENSIONS = ts_dimensions
     GLOBAL_EXCLUDE_FULL  = exclude_full
-    GLOBAL_METRIC        = metric
     GLOBAL_N_SEEDS       = n_seeds
     GLOBAL_N_INIT        = n_init
     GLOBAL_MAX_ITER      = max_iterations
@@ -147,29 +143,26 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
     cluster_name = (
         f"KMeans_{k}_cluster_seed{seed}_on_{GLOBAL_DATA_TYPE}"
         f"_excludeFull{GLOBAL_EXCLUDE_FULL}_nrep>1_locSite=True"
-        f"_log2FC>0.5_conditions({conditions_str})_metric{GLOBAL_METRIC}"
+        f"_log2FC>0.5_conditions({conditions_str})"
     )
     print(f"[clustering pid={os.getpid()}] k={k} seed={seed}", flush=True)
 
     # GLOBAL_DF is already copy-on-write isolated in this process; no .copy() needed.
-    df_clustered, model, multivariate = tslearn_clustering_KMeans(
+    KShape_all_univariate, model, multivariate = tslearn_clustering_KShape(
         df_to_cluster=GLOBAL_DF,
         data_type=GLOBAL_DATA_TYPE,
         condition_for_clustering=GLOBAL_CONDITIONS,
         exclude_full=GLOBAL_EXCLUDE_FULL,
-        cluster_column_name=cluster_name,
         number_of_clusters=k,
-        max_iterations=GLOBAL_MAX_ITER,
+        cluster_column_name=cluster_name,
         n_init=GLOBAL_N_INIT,
-        metric=GLOBAL_METRIC,
+        max_iterations=GLOBAL_MAX_ITER,
         df_dimensions=GLOBAL_TS_DIMENSIONS,
         time_series_length=GLOBAL_TS_LENGTH,
         random_state=seed,
-        transpose=True,
+        transpose=True,  # true
         verbose=False,
-        testing=True,
-        barycenter_calculations=False,
-    )
+        testing=True)
 
     return {
         "k": k,
@@ -287,8 +280,8 @@ def main() -> None:
                         help="Number of time series dimensions (default: 3)")
     parser.add_argument("--exclude_full",     type=bool,  default=True,
                         help="Exclude full data (default: True)")
-    parser.add_argument("--metric",           type=str,   default="euclidean",
-                        help="Distance metric for clustering (default: euclidean)")
+    # parser.add_argument("--metric",           type=str,   default="euclidean",
+    #                     help="Distance metric for clustering (default: euclidean)")
     parser.add_argument("--n_seeds",          type=int,   default=10,
                         help="Number of seeds for stability calculation (default: 10)")
     parser.add_argument("--n_init",           type=int,   default=5,
@@ -325,7 +318,7 @@ def main() -> None:
         f"Run config:\n"
         f"  data_type={args.data_type} | k={args.k_start}–{args.k_end}\n"
         f"  conditions={args.conditions} | ts_length={args.ts_length} | ts_dimensions={args.ts_dimensions}\n"
-        f"  exclude_full={args.exclude_full} | metric={args.metric}\n"
+        f"  exclude_full={args.exclude_full} \n"
         f"  n_seeds={args.n_seeds} | n_init={args.n_init} | max_iterations={args.max_iterations}\n"
         f"  workers={args.workers} | metrics_workers={metrics_workers}\n"
         f"  sil_min={args.sil_min} | sil_patience={args.sil_patience}\n"
@@ -405,7 +398,7 @@ def main() -> None:
                 args.ts_length,
                 args.ts_dimensions,
                 args.exclude_full,
-                args.metric,
+                # args.metric,
                 args.n_seeds,
                 args.n_init,
                 args.max_iterations,
@@ -537,7 +530,7 @@ def main() -> None:
     k_list = list(ks)
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f"Kmeans Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"KShape Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
 
     for metric_name, values, ylabel, subplot in [
         ("inertia",    inertias,    "Inertia",                       0),
