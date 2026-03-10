@@ -1,25 +1,19 @@
-/Experiment/1_hTERT_HME1/Data/*
-/Experiment/1_hTERT_HME1/Results/*
-/Experiment/1_hTERT_HME1/1_hTERT_HME1_Report.md
-Experiment/1_HEK293T/Data/All/*.xlsx
+./Experiment/1_hTERT_HME1/*
 
+./Experiment/1_HEK293T/*
 
-/Experiment/2_hTERT_HME1/Data/*
-/Experiment/2_hTERT_HME1/Results/*
+./Experiment/2_hTERT_HME1/*
 
-/Experiment/1_HEK293T/Data/*
-/Experiment/1_HEK293T/Results/*
-Experiment/1_HEK293T/Data/All/*.xlsx
+./Experiment/3_hTERT_HME1_mutants_comparison/*
 
+./Experiment/General_result/*
 
-/External_Data
+./Experiment/Kinase_list.xlsx
 
-/Old_code
+./External_Data
 
-/will_delete
+./Old_code
 
-/Experiment/Kinase_list.xlsx
+./will_delete
 
-/Global_report.md
-
-/Experiment/*
+./Server_results

@@ -19,6 +19,9 @@ import tslearn as tsl
 from tslearn.metrics import cdist_dtw
 import math
 
+from tslearn.metrics import cdist_dtw
+from sklearn.metrics import silhouette_score
+
 
 import warnings
 
@@ -988,7 +991,8 @@ def tslearn_clustering_KMeans(df_to_cluster,
                               time_series_length = int,
                               transpose = False,
                               verbose = True,
-                              testing = False):
+                              testing = False,
+                              barycenter_calculations = False):
 
     column_names = df_to_cluster.columns.tolist()
     if len(condition_for_clustering) == 0:
@@ -1009,15 +1013,21 @@ def tslearn_clustering_KMeans(df_to_cluster,
         print(f"Example:\n{multivariate_df[0]}")
 
     clustering = TimeSeriesKMeans(n_clusters=number_of_clusters, max_iter=max_iterations, n_init=n_init,  metric=metric, max_iter_barycenter=1000, verbose=verbose, random_state=random_state).fit(multivariate_df)
-
-    df_to_cluster[f"{cluster_column_name}"] = clustering.labels_
+        # I dont fing a difference between using fit() or using fit_predict()
+    df_to_cluster[f"{cluster_column_name}"] = clustering.labels_# If I use fit_predict(), I dont need ".labels_"
 
     if testing == True:
-        print("Returning the following elements in order: "
-              "\n- dataframe with the clusters made"
-              "\n- clustering model (model.fit()) (here you can apply functions for the model as .labels_"
-              "\n- multivariate_df (np array to cluster (n, t, d) (the np.array)")
-        return df_to_cluster, clustering, multivariate_df
+        if barycenter_calculations == True:
+            barycenters_distances = TimeSeriesKMeans(n_clusters=number_of_clusters, max_iter=max_iterations, n_init=n_init,
+                                          metric=metric, max_iter_barycenter=1000, verbose=verbose,
+                                          random_state=random_state).fit_transform(multivariate_df)
+            # print("Returning the following elements in order: "
+            #       "\n- dataframe with the clusters made"
+            #       "\n- clustering model (model.fit()) (here you can apply functions for the model as .labels_"
+            #       "\n- multivariate_df (np array to cluster (n, t, d) (the np.array)")
+            return df_to_cluster, clustering, multivariate_df, barycenters_distances
+        else:
+            return df_to_cluster, clustering, multivariate_df
     else:
         return df_to_cluster
 
