@@ -170,6 +170,7 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
         testing=True,
         barycenter_calculations=False,
     )
+    # print(f"[worker] conditions={GLOBAL_CONDITIONS} | multivariate shape={multivariate.shape}", flush=True)
 
     return {
         "k": k,
@@ -227,6 +228,7 @@ def metrics_worker(k_results_dir_tuple: tuple) -> dict:
     if seed0:
         inertia_for_k      = seed0[0]["inertia"]
         multivariate_seed0 = seed0[0]["multivariate"]
+        # print(f"k={k} multivariate_seed0 shape: {multivariate_seed0.shape}", flush=True)
     else:
         print(f"WARNING: seed 0 result missing for k={k}; inertia=NaN", flush=True)
         inertia_for_k      = np.nan
@@ -361,7 +363,8 @@ def main() -> None:
     # Checkpoint: skip Stage 1 if a checkpoint already exists
     # If Stage 2 crashed previously, rerun the same command to resume.
     # ------------------------------------------------------------------
-    checkpoint_path = f"{args.output_file_path}_checkpoint.pkl"
+    conditions_label = "+".join(c.strip("_") for c in args.conditions)
+    checkpoint_path = f"{args.output_file_path}_checkpoint_{conditions_label}.pkl"
 
     if os.path.exists(checkpoint_path):
         print(

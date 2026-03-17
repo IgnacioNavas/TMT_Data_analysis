@@ -354,7 +354,8 @@ def main() -> None:
     # Checkpoint: skip Stage 1 if a checkpoint already exists
     # If Stage 2 crashed previously, rerun the same command to resume.
     # ------------------------------------------------------------------
-    checkpoint_path = f"{args.output_file_path}_checkpoint.pkl"
+    conditions_label = "+".join(c.strip("_") for c in args.conditions)
+    checkpoint_path = f"{args.output_file_path}_checkpoint_{conditions_label}.pkl"
 
     if os.path.exists(checkpoint_path):
         print(

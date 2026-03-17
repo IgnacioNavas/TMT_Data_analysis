@@ -30,6 +30,7 @@ CLI arguments:
   --n_seeds           : number of seeds for stability (default: 10)
   --n_init            : KMeans initialisations per run (default: 5)
   --max_iterations    : max KMeans iterations (default: 100)
+  --kernel_metric"    : Kernel metric for clustering (default: gak)
   --workers           : worker processes for Stage 1 (default: 6)
   --metrics_workers   : worker processes for Stage 2 (default: min(workers, 30))
   --sil_min           : silhouette threshold for early stopping (default: disabled)
@@ -42,6 +43,7 @@ import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import shutil
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — no display needed on server
@@ -49,7 +51,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.metrics import adjusted_rand_score, silhouette_score
-from tslearn.metrics import cdist_dtw
+from tslearn.metrics import cdist_gak, sigma_gak  #cdist_dtw
 
 from utils import (
     filter_replicates,
@@ -157,7 +159,7 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
 
     # GLOBAL_DF is already copy-on-write isolated in this process; no .copy() needed.
     df_clustered, model, multivariate = kernnel_clustering(
-        df_to_cluster=GLOBAL_DF,
+        df_to_cluster=GLOBAL_DF.copy(),  # .copy() to avoid the dataframe to keep growing
         transpose=True,
         data_type=GLOBAL_DATA_TYPE,
         exclude_full=GLOBAL_EXCLUDE_FULL,
@@ -181,6 +183,8 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
         "inertia": model.inertia_,
         # Only ship multivariate back for seed 0 — needed once per k for silhouette.
         "multivariate": multivariate if seed == 0 else None,
+        # "gak_sigma": model.kernel_params_.get("sigma", None) if seed == 0 else None,
+        "gak_sigma": sigma_gak(multivariate) if seed == 0 else None,
     }
 
 
@@ -228,25 +232,61 @@ def metrics_worker(k_results_dir_tuple: tuple) -> dict:
     # --- Inertia (from seed 0) ---
     seed0 = [r for r in results if r["seed"] == 0]
     if seed0:
-        inertia_for_k      = seed0[0]["inertia"]
+        inertia_for_k = seed0[0]["inertia"]
+        if inertia_for_k is None:
+            inertia_for_k = np.nan
         multivariate_seed0 = seed0[0]["multivariate"]
     else:
         print(f"WARNING: seed 0 result missing for k={k}; inertia=NaN", flush=True)
-        inertia_for_k      = np.nan
+        inertia_for_k = np.nan
         multivariate_seed0 = None
+    # if seed0:
+    #     inertia_for_k      = seed0[0]["inertia"]
+    #     multivariate_seed0 = seed0[0]["multivariate"]
+    # else:
+    #     print(f"WARNING: seed 0 result missing for k={k}; inertia=NaN", flush=True)
+    #     inertia_for_k      = np.nan
+    #     multivariate_seed0 = None
 
     # --- Silhouette score via DTW distance matrix ---
     # cdist_dtw respects temporal structure for both univariate and multivariate.
     # Each worker builds its own DTW matrix (~270MB for n=5825) independently,
     # which is freed from memory as soon as this function returns.
+    # --- NEW silhouette block (Kernel distance) ---
     sil = np.nan
     if multivariate_seed0 is not None and 0 in seed_to_labels:
-        D = cdist_dtw(multivariate_seed0)
         try:
+            # Retrieve sigma saved from seed 0 result
+            gak_sigma = seed0[0].get("gak_sigma", None)
+
+            # Fallback: estimate sigma from data if not saved
+            # if gak_sigma is None or gak_sigma == "auto":
+            #     gak_sigma = sigma_gak(multivariate_seed0) # {"sigma":"auto"}
+
+            # Build kernel matrix
+            K = cdist_gak(multivariate_seed0, multivariate_seed0, sigma=gak_sigma)
+
+            # Convert kernel similarity → distance
+            # D(i,j) = sqrt(K(i,i) - 2*K(i,j) + K(j,j))
+            diag = np.diag(K)
+            D = np.sqrt(np.clip(diag[:, None] - 2 * K + diag[None, :], 0, None))
+
             sil = silhouette_score(D, seed_to_labels[0], metric="precomputed")
+
         except ValueError as exc:
-            # Can happen when k >= n_samples
             print(f"Silhouette skipped for k={k}: {exc}", flush=True)
+        except Exception as exc:
+            print(f"Silhouette error for k={k}: {exc}", flush=True)
+
+
+    # sil = np.nan
+    # if multivariate_seed0 is not None and 0 in seed_to_labels:
+    #     D = cdist_dtw(multivariate_seed0)
+    #     try:
+    #         sil = silhouette_score(D, seed_to_labels[0], metric="precomputed")
+    #     except ValueError as exc:
+    #         # Can happen when k >= n_samples
+    #         print(f"Silhouette skipped for k={k}: {exc}", flush=True)
 
     # --- Stability: mean pairwise ARI across all seeds ---
     labels_list = list(seed_to_labels.values())
@@ -257,11 +297,20 @@ def metrics_worker(k_results_dir_tuple: tuple) -> dict:
     ]
     stability = np.mean(ari_scores) if ari_scores else np.nan
 
+    def _fmt(v):
+        return f"{v:.4f}" if v is not None and not np.isnan(v) else "NaN"
+
     print(
         f"[metrics pid={os.getpid()}] "
-        f"k={k:3d} | inertia={inertia_for_k:.4f} | silhouette={sil:.4f} | stability={stability:.4f}",
+        f"k={k:3d} | inertia={_fmt(inertia_for_k)} | silhouette={_fmt(sil)} | stability={_fmt(stability)}",
         flush=True,
     )
+
+    # print(
+    #     f"[metrics pid={os.getpid()}] "
+    #     f"k={k:3d} | inertia={inertia_for_k:.4f} | silhouette={sil:.4f} | stability={stability:.4f}",
+    #     flush=True,
+    # )
 
     return {"k": k, "inertia": inertia_for_k, "silhouette": sil, "stability": stability}
 
@@ -289,7 +338,7 @@ def main() -> None:
     parser.add_argument("--ts_dimensions",    type=int,   default=3,
                         help="Number of time series dimensions (default: 3)")
     parser.add_argument("--exclude_full",     type=bool,  default=True,
-                        help="Exclude full data (default: True)")
+                        help="Exclude full data (default: True)") # Potentially sing true even if I define False
     parser.add_argument("--metric",           type=str,   default="euclidean",
                         help="Distance metric for clustering (default: euclidean)")
     parser.add_argument("--n_seeds",          type=int,   default=10,
@@ -366,7 +415,8 @@ def main() -> None:
     # Checkpoint: skip Stage 1 if a checkpoint already exists
     # If Stage 2 crashed previously, rerun the same command to resume.
     # ------------------------------------------------------------------
-    checkpoint_path = f"{args.output_file_path}_checkpoint.pkl"
+    conditions_label = "+".join(c.strip("_") for c in args.conditions)
+    checkpoint_path = f"{args.output_file_path}_checkpoint_{conditions_label}.pkl"
 
     if os.path.exists(checkpoint_path):
         print(
@@ -566,7 +616,7 @@ def main() -> None:
     # Cleanup: remove temp directory (pickle files)
     # Checkpoint is kept intentionally for potential re-runs
     # ------------------------------------------------------------------
-    import shutil
+
     shutil.rmtree(tmpdir)
     print(
         f"\nTemp files cleaned up.\n"
