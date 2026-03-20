@@ -2210,3 +2210,687 @@ def clusters_plot_overlay_conditions(
             plt.close(fig)
 
         # return fig, ax
+
+#%%
+def plot_mutants_protein_phosphosites(df,
+                              data_type = str,
+                              proteins=list,
+                              replicates = False,
+                              exclude_rep = list,
+                              legend_plot = list,
+                              color_palette = ['r', 'b', 'fuchsia'],
+                              saving_path=str,
+                              saving_info="",
+                              title_info = "",
+                              plot_individually=False,
+                              fit_y_lims=False,
+                              plot_close=False,
+                              save_pdf=False,
+                              save_png=False):
+    '''Plot to PDF ALL phosphosites of a list of proteins. You can decide to plot the phosphosties of the protein
+    together in one plot or to plot them separatly.'''
+
+    # Check if the df is a pandas dataframe already or the path to it
+    if type(df) == pd.DataFrame:
+        pass
+    else:
+        df = pd.read_excel(df)
+
+    # If the file generated is not going to be saved don't create the saving folder
+    if save_pdf == False and save_png == False:
+        pass
+    else:  # If the files are going to be saved, check if the path exist, if not, create it
+        if not os.path.exists(saving_path):
+            print("Creating saving folder")
+            os.makedirs(saving_path)
+
+    for protein in proteins:
+        # Create sub-dataframe with only the protein we are interested in. If the protein doesn't exist in the dataframe skip code
+        if protein in df['protein_name'].to_list():
+            sub_df = df.loc[df['protein_name'] == protein].copy()
+            print(f"Ploting sites of protein {protein}")
+        elif protein in df['protein_Id'].to_list():
+            sub_df = df.loc[df['protein_Id'] == protein].copy()
+            print(f"Ploting sites of protein {protein}")
+        else:
+            print(f"The protein {protein} is not present in the dataset")
+            continue
+
+        # Extract the protein name and protein uniprot code for the folder
+        saving_folder = f"{list(sub_df.protein_name)[0]}_{list(sub_df.protein_Id)[0]}"
+
+        # Check if a folder for the desired protein exists. If no, create one
+        if save_pdf == False and save_png == False:
+            pass
+        else:
+            if saving_folder in os.listdir(saving_path):
+                pass
+            else:
+                new_path = f"{saving_path}/{saving_folder}"
+                print(f"Createating saving folder for {saving_folder}")
+                os.makedirs(new_path)
+
+        # Sort the pepetides of the dataframe for better interpretation of the figure generated
+        sub_df.sort_values(by=['site'], inplace=True)
+
+        # Determine the dimentional space for the subplot
+        number_phos = len(sub_df)
+        sqrt_n_p = int(np.ceil(np.sqrt(number_phos)))  # Plotting time points in a matrix
+        if sqrt_n_p <= 2:  # 1 plot doesn't work, 2 plots leave empty row below
+            empty_plots = 0
+        else:
+            empty_plots = (sqrt_n_p * sqrt_n_p) - number_phos
+        # Avoid getting rows with empty plots
+        if empty_plots >= sqrt_n_p:
+            sqrt_n_p_X = sqrt_n_p - 1
+        else:
+            sqrt_n_p_X = sqrt_n_p
+
+        # Columns to determine the "y" axis limit values
+        column_names = df.columns.tolist()
+        # column_selection = [element for element in column_names if data_type in element]
+        if data_type == "raw":
+            data_type = "raw_mean"
+            column_selection = [element for element in column_names if data_type in element]
+            data_type = "raw"
+        elif data_type == "log2":
+            data_type = "log2_mean"
+            column_selection = [element for element in column_names if data_type in element]
+            data_type = "log2"
+        else:
+            column_selection = [element for element in column_names if data_type in element and "clusters" not in element]
+        print(column_selection)
+
+        if plot_individually == True:
+            for index, row in sub_df.iterrows():
+
+                protein_name = row["protein_name"]
+                site = row["site"]
+                # Y axis limit
+                if fit_y_lims == True:
+                    y_fixed = "y_axis_fixed"
+                elif type(fit_y_lims) == list:
+                    y_lim_min = fit_y_lims[0]
+                    y_lim_max = fit_y_lims[1]
+                    y_fixed = f"_y_axis_fixed_{y_lim_min}_{y_lim_max}"
+                elif fit_y_lims == False:
+                    sub_values_df = sub_df.loc[:,column_selection]
+                    y_lim_max = (sub_values_df.max().max()) * 1.05
+                    y_lim_min = (sub_values_df.min().min()) * 0.95
+                    if y_lim_min < 0:
+                        y_lim_min = (sub_values_df.min().min()) + (sub_values_df.min().min())* 0.1
+
+                fig, axes = plt.subplots()
+                plot_data(ax = axes, row_df = row, replicates = replicates, data_type= data_type, colors = color_palette, legend = legend_plot, exclude_rep=exclude_rep, plot_individually=plot_individually)
+                # Apply the y limit axis
+                if fit_y_lims == True:
+                    if data_type == "raw" or data_type == "log2_FC":
+                        if min(row[column_selection]) < 0 :
+                            y_lim_min = min(row[column_selection]) + min(row[column_selection])*0.1
+                            axes.set_ylim(y_lim_min, max(row[column_selection])*1.1)
+                        else:
+                            axes.set_ylim(min(row[column_selection])*0.9, max(row[column_selection])*1.1)
+                    else:
+                        axes.set_ylim(min(row[column_selection])*0.97, max(row[column_selection])*1.02)
+                else:
+                    axes.set_ylim(y_lim_min, y_lim_max)
+                axes.set_xlim(-1, 7)
+
+                if save_pdf == True:
+                    plt.savefig(f"{saving_path}/{saving_folder}/{protein_name}_{site}_{saving_info}.pdf")
+                    print(f"{protein_name}_{site}_{saving_info}.pdf Plot saved as PDF")
+                if save_png == True:
+                    plt.savefig(f"{saving_path}/{saving_folder}/{protein_name}_{site}_{saving_info}.png")
+                    print(f"{protein_name}_{site}_{saving_info}.png Plot saved as PNG")
+                if save_pdf == False and save_png == False:
+                    print(f"{protein_name}_{site}_{saving_info} Plot not saved")
+
+        else:
+            k = 0
+            fig, axes = plt.subplots(sqrt_n_p, sqrt_n_p_X , figsize=(18, 13))  #
+            fig.tight_layout(w_pad=1.75, h_pad=3)
+            plt.subplots_adjust(top=0.94)
+
+            # Force axes into a 2D array
+            if len(sub_df) == 1:
+                axes = np.array([[axes]])  # Wrap single Axes in a 2D array
+            elif sqrt_n_p == 1 or sqrt_n_p_X == 1:
+                axes = np.atleast_2d(axes)
+
+            # Y axis limit
+            if fit_y_lims == True:
+                y_fixed = "y_axis_fixed"
+            elif type(fit_y_lims) == list:
+                y_lim_min = fit_y_lims[0]
+                y_lim_max = fit_y_lims[1]
+                y_fixed = f"_y_axis_fixed_{y_lim_min}_{y_lim_max}"
+            elif fit_y_lims == False:
+                sub_values_df = sub_df.loc[:,column_selection]
+                y_lim_max = (sub_values_df.max().max()) * 1.02
+                y_lim_min = (sub_values_df.min().min()) * 0.97
+                if y_lim_min < 0:
+                    y_lim_min = (sub_values_df.min().min()) + (sub_values_df.min().min())* 0.1
+
+            for i in range(sqrt_n_p):  # y
+                for j in range(sqrt_n_p_X):  # X
+                    if k >= number_phos:  # Stop plotting, all phosphorylation sites have been plotted
+                        fig.delaxes(axes[i, j])
+
+                    else:
+                        row = sub_df.iloc[k,:]
+                        # print(data_type)
+
+                        plot_data(ax = axes[i,j], row_df = row, replicates = replicates,  data_type= data_type, colors = color_palette, legend = legend_plot, exclude_rep=exclude_rep, plot_individually=plot_individually) # data_type= data_type,
+
+                        if fit_y_lims == True:
+                            if data_type == "raw" or data_type == "log2_FC":
+                                if min(row[column_selection]) < 0 :
+                                    y_lim_min = min(row[column_selection]) + min(row[column_selection])*0.1
+                                    axes[i,j].set_ylim(y_lim_min, max(row[column_selection])*1.1)
+                                else:
+                                    axes[i,j].set_ylim(min(row[column_selection])*0.9, max(row[column_selection])*1.1)
+                            else:
+                                axes[i,j].set_ylim(min(row[column_selection])*0.97, max(row[column_selection])*1.02)
+                        else:
+                            axes[i, j].set_ylim(y_lim_min, y_lim_max)
+
+                        axes[i, j].set_xlim(-1, 7)
+                        # fig.tight_layout()
+                        k = k + 1
+
+            fig.legend(labels=legend_plot, loc="upper right", ncol=3)
+            fig.suptitle(f"{saving_folder} {title_info} ({date.today()})", weight='bold')
+            fig.tight_layout()
+
+            if save_pdf == True:
+                plt.savefig(f"{saving_path}/{saving_folder}/{saving_folder}_{data_type}_{saving_info}.pdf")
+                print(f"{saving_folder}_{data_type}_{saving_info}.pdf Plot saved as PDF")
+            if save_png == True:
+                plt.savefig(f"{saving_path}/{saving_folder}/{saving_folder}_{data_type}_{saving_info}.png")
+                print(f"{saving_folder}_{data_type}_{saving_info}.png Plot saved as PNG")
+            if save_pdf == False and save_png == False:
+                print(f"{saving_folder}_{data_type}_{saving_info} Plot not saved")
+    if plot_close == True:
+        plt.close(fig)
+#%%
+def filter_dynamics_extremes_mutants(
+    df,
+    data_type="log2:FC",
+    threshold=0.5,
+    exclude_full = False,
+    conditions = ["_EGF_"],
+    cell_lines = ["WT", "BRAFS151A", "GAB1Y259A"],
+):
+    """
+
+    """
+    # Select relevant columns
+    column_names = df.columns.tolist()
+    clustering_dic = {cell: {condition: {} for condition in conditions} for cell in cell_lines}
+    # print(column_names)
+    for cell in cell_lines:
+        for condition in conditions:
+            clustering_dic[cell][condition] = [col for col in column_names
+                                                          if col.startswith(cell)
+                                                          and condition in col
+                                                          and data_type in col]
+            if exclude_full == True:
+                clustering_dic[cell][condition] = [col for col in list(clustering_dic[cell][condition]) if "full" not in col]
+
+    # print(clustering_dic)
+    column_selection = [value for key1 in clustering_dic
+                          for key2 in clustering_dic[key1]
+                          for value in clustering_dic[key1][key2]]
+    # print(column_selection)
+
+    mask = df[column_selection].abs().max(axis=1) >= threshold
+    return df.loc[mask].copy()
+
+#%%
+def reshape_df_mutants(df,
+               time_series,
+               dimensions,
+               len_time_serie,
+               verbose,
+               labels = str,
+               transpose = False):
+    '''Reshape dataframe so it is multivariate format. Return the dataframe in numpy format so can be used, and list with the names of myseries'''
+
+    sub_df = df[time_series].copy()
+    mySeries = sub_df.to_numpy()
+    namesofMySeries = df[labels]
+
+    multivariate_shape = (len(df), dimensions, len_time_serie)
+    ###        #add an "if" variable so if shape[1] of df 1 !== 21, the selection of the columns is wrong
+    if verbose == True and transpose == False:
+        print(f"Reshaping dataframe to shape {multivariate_shape}")
+
+    multivariate_df = np.reshape(mySeries, multivariate_shape)
+    if transpose == True:
+        multivariate_df = multivariate_df.transpose(0, 2, 1)
+        if verbose == True:
+            print(f"Reshaping dataframe to shape {multivariate_df.shape}")
+
+
+    return multivariate_df, namesofMySeries
+
+#%%
+def tslearn_clustering_KMeans_mutants(df_to_cluster,
+                              data_type,
+                              condition_for_clustering = list,
+                              cell_lines = list,
+                              exclude_full = False,
+                              cluster_column_name = str,
+                              number_of_clusters = int,
+                              max_iterations = 1000,
+                              n_init = 5,
+                              metric='euclidean',
+                              df_dimensions = int,
+                              random_state = 0,
+                              time_series_length = int,
+                              transpose = False,
+                              verbose = True,
+                              testing = False,
+                              barycenter_calculations = False):
+
+    column_names = df_to_cluster.columns.tolist()
+    clustering_dic = {cell: {condition: {} for condition in condition_for_clustering} for cell in cell_lines}
+    for cell in cell_lines:
+        for condition in condition_for_clustering:
+            clustering_dic[cell][condition] = [col for col in column_names
+                                                          if col.startswith(cell)
+                                                          and condition in col
+                                                          and data_type in col
+                                                          and "cluster" not in col]
+            if exclude_full == True:
+                clustering_dic[cell][condition] = [col for col in list(clustering_dic[cell][condition]) if "full" not in col]
+
+    column_selection = [value for key1 in clustering_dic
+                          for key2 in clustering_dic[key1]
+                          for value in clustering_dic[key1][key2]]
+    if verbose == True:
+        print(f"{df_to_cluster.shape}")
+        print(f"Column selection: {column_selection}\n")
+
+    multivariate_df, names_of_myseries = reshape_df_mutants(df = df_to_cluster, time_series = column_selection, dimensions = df_dimensions, len_time_serie = time_series_length, transpose=transpose, labels = "site", verbose=verbose)
+
+    if verbose == True:
+        print(f"\nThe size of the dataset is {multivariate_df.shape}")
+        print(f"Example:\n{multivariate_df[0]}")
+
+    clustering = TimeSeriesKMeans(n_clusters=number_of_clusters, max_iter=max_iterations, n_init=n_init,  metric=metric, max_iter_barycenter=1000, verbose=verbose, random_state=random_state).fit(multivariate_df)
+        # I dont fing a difference between using fit() or using fit_predict()
+    df_to_cluster[f"{cluster_column_name}"] = clustering.labels_# If I use fit_predict(), I dont need ".labels_"
+
+    if testing == True:
+        if barycenter_calculations == True:
+            barycenters_distances = TimeSeriesKMeans(n_clusters=number_of_clusters, max_iter=max_iterations, n_init=n_init,
+                                          metric=metric, max_iter_barycenter=1000, verbose=verbose,
+                                          random_state=random_state).fit_transform(multivariate_df)
+            # print("Returning the following elements in order: "
+            #       "\n- dataframe with the clusters made"
+            #       "\n- clustering model (model.fit()) (here you can apply functions for the model as .labels_"
+            #       "\n- multivariate_df (np array to cluster (n, t, d) (the np.array)")
+            return df_to_cluster, clustering, multivariate_df, barycenters_distances
+        else:
+            return df_to_cluster, clustering, multivariate_df
+    else:
+        return df_to_cluster
+
+#%%
+def clusters_plot_linear_mutants(
+    df,
+    legend=list,
+    saving_path=str,
+    cluster_column=str,
+    cluster_name="",
+    data_type=str,
+    cell_lines=[],
+    conditions=[],
+    colors={"WT": "black", "BRAFS151A": "blue", "GAB1Y259A": "green"},
+    same_cell_lines=False,
+    same_condition=False,
+    plot_different_data=False,
+    saving_info="",
+    save_pdf=False,
+    save_png=False,
+    plot_close=False,
+    y_lims_list=False,
+    grey_alpha=0.08,
+    grey_lw=0.8,
+    mean_lw=2.6):
+
+    if type(df) == pd.DataFrame:
+        pass
+    else:
+        df = pd.read_excel(df)
+
+    if save_pdf or save_png:
+        if not os.path.exists(saving_path):
+            print("Creating saving folder")
+            os.makedirs(saving_path)
+
+    clusters = list(set(df[cluster_column]))
+    if 999 in clusters:
+        clusters.remove(999)
+
+    if data_type not in cluster_column and plot_different_data == False:
+        print("Remember to plot the same data_type used to make the clustering or put: plot_different_data = TRUE")
+        return
+
+    # Sort clusters
+    if type(clusters[0]) == int:
+        sorted_clusters = sorted(clusters)
+    else:
+        sorted_clusters = sorted(clusters, key=lambda x: int(x.split()[1]))
+
+    n_cluster = len(sorted_clusters)
+
+    # Time points
+    column_names = df.columns.tolist()
+    x_axis_previous = [col for col in column_names if f"{cell_lines[0]}_{data_type}{conditions[0]}" in col]
+    time_points = [s.split("_")[3] for s in x_axis_previous]
+    # print(time_points)
+
+    # Build column lookup
+    columns_dir = {condition: {cell: {} for cell in cell_lines} for condition in conditions}
+    sub_dtp = data_type.split(":")
+
+    for condition in conditions:
+        for cell in cell_lines:
+            columns_dir[condition][cell]["plotting"] = [
+                col for col in column_names
+                if col.startswith(cell)
+                and condition in col
+                and sub_dtp[0] in col
+                and sub_dtp[1] in col
+            ]
+    # print(columns_dir)
+
+    fig, axes = plt.subplots(
+        nrows=n_cluster,
+        ncols=len(cell_lines),
+        figsize=(6 * len(cell_lines), max(3.2 * n_cluster, 6)),
+        squeeze=False
+    )
+
+    for r, cluster in enumerate(sorted_clusters):
+        sub_df = df.loc[df[cluster_column] == cluster].copy()
+        if sub_df.shape[0] == 0:
+            continue
+        # print(cell_lines)
+        for c, cell in enumerate(cell_lines):
+            ax = axes[r, c]
+            # print(r,c)
+
+            color = colors[cell]
+            # print(color)
+            cond_cols = columns_dir[condition][cell]["plotting"]
+
+            mat = sub_df[cond_cols].to_numpy(dtype=float)
+            for i in range(mat.shape[0]):
+                ax.plot(time_points, mat[i, :], color="grey", alpha=grey_alpha, linewidth=grey_lw)
+
+            mean_curve = np.nanmean(mat, axis=0)
+            ax.plot(time_points, mean_curve, color=color, linewidth=mean_lw)
+
+            ax.axhline(0, color="grey", linestyle="--", linewidth=1)
+            ax.grid(True, alpha=0.3)
+
+            if r == n_cluster - 1:
+                ax.set_xlabel("Time (min)")
+            ax.set_ylabel(f"{data_type}" if c == 0 else "")
+            ax.set_title(f"Cluster {cluster} | {condition} — {cell} (n={sub_df.shape[0]} sites)")
+
+            ax.set_xticks(range(len(time_points)))
+            ax.set_xticklabels([str(t) for t in time_points])
+
+    # Legend always by cell line
+    handles = [
+        plt.Line2D([0], [0], color=colors.get(cl, "black"), lw=mean_lw)
+        for cl in cell_lines
+    ] + [plt.Line2D([0], [0], color="grey", lw=grey_lw, alpha=0.4)]
+    labels = list(cell_lines) + ["Individual sites"]
+    fig.legend(handles, labels, loc="upper right", ncol=1)
+
+    fig.suptitle(f"{cluster_column} {cluster_name} {date.today()}", weight="bold")
+
+    if save_pdf:
+        plt.savefig(f"{saving_path}/{cluster_name}{saving_info}.pdf", bbox_inches="tight")
+        print(f"{cluster_name}{saving_info} Plot saved as PDF")
+    if save_png:
+        plt.savefig(f"{saving_path}/{cluster_name}{saving_info}.png", bbox_inches="tight", dpi=300)
+        print(f"{cluster_name}{saving_info} Plot saved as PNG")
+    if not save_pdf and not save_png:
+        print(f"{cluster_name}{saving_info} Plot not saved")
+
+    if plot_close:
+        plt.close(fig)
+
+#%%
+def plot_data_mutants_2(ax,
+              row_df,
+              data_type="log2:FC",
+              colors={"WT": "black", "BRAFS151A": "blue", "GAB1Y259A": "green"},
+              legend=[],
+              cell_lines=[],
+              conditions=[]):
+
+    column_names = row_df.index.tolist()
+    sub_dtp = data_type.split(":")  # e.g. ["log2", "FC"]
+
+    # Build a lookup: columns_dir[cell][condition] -> {"plotting": [...], "sd": [...]}
+    columns_dir = {cell: {condition: {} for condition in conditions} for cell in cell_lines}
+
+    for cell in cell_lines:
+        for condition in conditions:
+            columns_dir[cell][condition]["plotting"] = [col for col in column_names
+                                                                if col.startswith(cell)
+                                                                and condition in col
+                                                                and sub_dtp[0] in col
+                                                                and sub_dtp[1] in col
+                                                        ]
+            columns_dir[cell][condition]["sd"] = [col for col in column_names
+                                                        if col.startswith(cell)
+                                                        and condition in col
+                                                        and sub_dtp[0] in col
+                                                        and "sd" in col
+                                                    ]
+
+    # Derive x-axis time points from the first valid cell/condition combination
+    x_axis_previous = [element for element in column_names if f"{cell_lines[0]}_{data_type}{conditions[0]}" in element] # this could be any set of columns that have the time points
+    x_axis = [s.split("_")[3] for s in x_axis_previous]
+
+    site = row_df["site"]
+    prot_name = row_df["protein_name"]
+    protein_ID = row_df["protein_Id"]
+
+    for condition in conditions:
+        for cell in cell_lines:
+            # plot_cols = columns_dir[cell][condition]["plotting"]
+            # sd_cols   = columns_dir[cell][condition]["sd"]
+            #
+            # if not plot_cols:
+            #     print(f"No plotting columns found for cell='{cell}', condition='{condition}'")
+            #     continue
+            #
+            # y_vals  = row_df[plot_cols].values.astype(float)
+            # y_err   = row_df[sd_cols].values.astype(float) if sd_cols else None
+
+            ax.errorbar(
+                x=x_axis,
+                y=row_df[columns_dir[cell][condition]["plotting"]].values.astype(float),
+                yerr=row_df[columns_dir[cell][condition]["sd"]].values.astype(float),
+                marker='o',
+                color=colors[cell],
+                label=cell,
+                capsize=4,
+                elinewidth=1.3,
+                alpha=1
+            )
+
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel(data_type)
+    ax.grid()
+    ax.set_title(str(site))
+
+    return ax
+
+#%%
+def plot_mutants_protein_phosphosites(df,
+                                      data_type=str,
+                                      proteins=list,
+                                      replicates=False,
+                                      exclude_rep=list,
+                                      legend_plot=list,
+                                      color_palette={"WT": "black",
+                                                     "BRAFS151A": "blue",
+                                                     "GAB1Y259A": "green"},
+                                      saving_path=str,
+                                      cell_lines=[],
+                                      conditions=[],
+                                      saving_info="",
+                                      title_info="",
+                                      plot_individually=False,
+                                      fit_y_lims=False,
+                                      plot_close=False,
+                                      save_pdf=False,
+                                      save_png=False):
+
+    # Load dataframe if a path was passed instead
+    if isinstance(df, pd.DataFrame):
+        pass
+    elif isinstance(df, str):
+        if df.endswith(".xlsx"):
+            df = pd.read_excel(df)
+        elif df.endswith(".tsv"):
+            df = pd.read_csv(df, sep="\t")
+        else:
+            raise ValueError("Unsupported file format. Use .xlsx or .tsv")
+
+    sub_dtp = data_type.split(":")  # e.g. ["log2", "FC"]
+
+    for protein in proteins:
+        # Select rows for this protein
+        if protein in df['protein_name'].values:
+            sub_df = df.loc[df['protein_name'] == protein].copy()
+        elif protein in df['protein_Id'].values:
+            sub_df = df.loc[df['protein_Id'] == protein].copy()
+        else:
+            print(f"Protein '{protein}' not found in dataset — skipping.")
+            continue
+
+        print(f"Plotting sites of protein: {protein}")
+
+        saving_folder = f"{sub_df['protein_name'].iloc[0]}_{sub_df['protein_Id'].iloc[0]}"
+
+        # Create output folder if saving
+        if (save_pdf or save_png) and saving_path:
+            new_path = os.path.join(saving_path, saving_folder)
+            os.makedirs(new_path, exist_ok=True)  # cleaner than manual check
+
+
+        # Determine the dimentional space for the subplot
+        sub_df = sub_df.sort_values(by=['site'])
+
+        number_phos = len(sub_df)
+        sqrt_n_p = int(np.ceil(np.sqrt(number_phos)))
+        sqrt_n_p_X = sqrt_n_p
+
+        if sqrt_n_p > 2:
+            empty_plots = (sqrt_n_p * sqrt_n_p) - number_phos
+            if empty_plots >= sqrt_n_p:
+                sqrt_n_p_X = sqrt_n_p - 1
+
+        # Identify value columns for y-limit calculation
+        column_names = df.columns.tolist()
+        column_selection = [col for col in column_names
+                                if sub_dtp[0] in col
+                                and sub_dtp[1] in col
+                                and "sd" not in col
+                                and "clusters" not in col
+                            ]
+
+        # Resolve y-axis limits up front
+        if isinstance(fit_y_lims, list):
+            y_lim_min, y_lim_max = fit_y_lims[0], fit_y_lims[1]
+            y_limt_info = f"_y_axis_fixed_{y_lim_min}_{y_lim_max}"
+            use_fixed_ylims = True
+        elif fit_y_lims is False:
+            sub_values_df = sub_df[column_selection] if column_selection else pd.DataFrame()
+            if not sub_values_df.empty:
+                y_lim_max = sub_values_df.max().max() * 1.02
+                y_lim_min = sub_values_df.min().min()
+                y_lim_min = y_lim_min + y_lim_min * 0.1 if y_lim_min < 0 else y_lim_min * 0.97
+            else:
+                y_lim_min, y_lim_max = None, None
+            use_fixed_ylims = False
+            y_limt_info = ""
+        else:  # fit_y_lims is True -> per-row dynamic limits
+            use_fixed_ylims = None  # signals "compute per row"
+            y_limt_info = "y_axis_perrow"
+
+        # Build figure
+        fig, axes = plt.subplots(sqrt_n_p, sqrt_n_p_X, figsize=(18, 13))
+        fig.tight_layout(w_pad=1.75, h_pad=3)
+        plt.subplots_adjust(top=0.94)
+
+        # Normalise axes to always be a 2D array
+        if number_phos == 1:
+            axes = np.array([[axes]])
+        else:
+            axes = np.atleast_2d(axes)
+
+        k = 0
+        for i in range(sqrt_n_p):
+            for j in range(sqrt_n_p_X):
+                if k >= number_phos:
+                    fig.delaxes(axes[i, j])
+                    continue
+
+                row = sub_df.iloc[k]
+
+                plot_data_mutants_2(ax=axes[i, j],
+                            row_df=row,
+                            data_type=data_type,
+                            colors=color_palette,
+                            legend=legend_plot,
+                            cell_lines=cell_lines,
+                            conditions=conditions
+                        )
+
+                # Apply y-limits
+                if use_fixed_ylims is None:  # per-row dynamic
+                    row_vals = row[column_selection].dropna() if column_selection else pd.Series()
+                    if not row_vals.empty:
+                        rmin, rmax = row_vals.min(), row_vals.max()
+                        pad_min = rmin + rmin * 0.1 if rmin < 0 else rmin * 0.9
+                        axes[i, j].set_ylim(pad_min, rmax * 1.1)
+                elif use_fixed_ylims and y_lim_min is not None:
+                    axes[i, j].set_ylim(y_lim_min, y_lim_max)
+                elif not use_fixed_ylims and y_lim_min is not None:
+                    axes[i, j].set_ylim(y_lim_min, y_lim_max)
+
+                axes[i, j].set_xlim(-1, 4)
+                k += 1
+
+        fig.legend(labels=legend_plot, loc="upper right", ncol=3)
+        fig.suptitle(f"{saving_folder} {title_info} ({date.today()})", weight='bold')
+        fig.tight_layout()
+
+        if save_pdf:
+            out = os.path.join(saving_path, saving_folder,
+                               f"{saving_folder}_{data_type}_{saving_info}.pdf")
+            plt.savefig(out)
+            print(f"Saved PDF: {out}")
+        if save_png:
+            out = os.path.join(saving_path, saving_folder,
+                               f"{saving_folder}_{data_type}_{saving_info}.png")
+            plt.savefig(out)
+            print(f"Saved PNG: {out}")
+        if not save_pdf and not save_png:
+            print(f"{saving_folder}_{data_type}_{saving_info} — plot not saved")
+
+        if plot_close:
+            plt.close(fig)
