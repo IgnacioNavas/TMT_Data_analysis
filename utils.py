@@ -791,7 +791,7 @@ def plot_protein_profile(df,
         os.makedirs(saving_path)
 
     column_names = df.columns.tolist()
-    all_conditions = [element for element in column_names if f"{data_type}_" in element]
+    all_conditions = [element for element in column_names if f"{data_type}_" in element and "cluster" not in element]
     EGF = [element for element in column_names if f"{data_type}_EGF_" in element]
     INS = [element for element in column_names if f"{data_type}_INS_" in element]
     EGFnINS = [element for element in column_names if f"{data_type}_EGFnINS_" in element]
@@ -886,7 +886,7 @@ def plot_protein_profiles_fine_line(df,
             os.makedirs(saving_path)
 
     column_names = df.columns.tolist()
-    all_conditions = [element for element in column_names if f"{data_type}_" in element]
+    all_conditions = [element for element in column_names if f"{data_type}_" in element and "cluster" not in element]
     EGF = [element for element in column_names if f"{data_type}_EGF_" in element]
     INS = [element for element in column_names if f"{data_type}_INS_" in element]
     EGFnINS = [element for element in column_names if f"{data_type}_EGFnINS_" in element]
@@ -996,11 +996,11 @@ def tslearn_clustering_KMeans(df_to_cluster,
 
     column_names = df_to_cluster.columns.tolist()
     if len(condition_for_clustering) == 0:
-        column_selection = [element for element in column_names if element.startswith(f"{data_type}")] #f"{data_type}" in element]
+        column_selection = [element for element in column_names if element.startswith(f"{data_type}")] # and "cluster" not in element] #f"{data_type}" in element]
         if exclude_full == True:
          column_selection = [element for element in column_names if element.startswith(f"{data_type}") and "full" not in element]
     else:
-        column_selection = [element for element in column_names if element.startswith(f"{data_type}") and any(cond in element for cond in condition_for_clustering)]
+        column_selection = [element for element in column_names if element.startswith(f"{data_type}") and any(cond in element for cond in condition_for_clustering)] # and "cluster" not in element]
         if exclude_full == True:
             column_selection = [element for element in column_names if element.startswith(f"{data_type}") and any(cond in element for cond in condition_for_clustering) and "full" not in element]
     if verbose == True:
@@ -2894,3 +2894,105 @@ def plot_mutants_protein_phosphosites(df,
 
         if plot_close:
             plt.close(fig)
+
+#%% Optimized for all experiments
+def plot_protein_profile_mutants(df,
+                                 proteins,
+                                 data_type = str,
+                                 cell_lines = [],
+                                 conditions = [],
+                                 saving_path="",
+                                 saving_info="",
+                                 legend=False,
+                                 save_pdf=False,
+                                 save_png=False):
+
+    # Load DataFrame from file if needed
+    if not isinstance(df, pd.DataFrame):
+        df = pd.read_excel(df)
+
+    # Create saving path if necessary
+    if (save_pdf or save_png) and not os.path.exists(saving_path):
+        print("Creating saving folder")
+        os.makedirs(saving_path)
+
+    column_names = df.columns.tolist()
+    sub_dtp = data_type.split(":")  # e.g. ["log2", "FC"]
+
+    # Build a lookup: columns_dir[cell][condition] -> {"plotting": [...], "sd": [...]}
+    columns_dir = {cell: {condition: {} for condition in conditions} for cell in cell_lines}
+
+    for cell in cell_lines:
+        for condition in conditions:
+            columns_dir[cell][condition] = [col for col in column_names
+                                            if col.startswith(cell)
+                                            and condition in col
+                                            and sub_dtp[0] in col
+                                            and sub_dtp[1] in col
+                                            and "cluster" not in col
+                                                        ]
+
+    # Derive x-axis time points from the first valid cell/condition combination
+    x_axis_previous = [element for element in column_names if
+                       f"{cell_lines[0]}_{data_type}{conditions[0]}" in element]  # this could be any set of columns that have the time points
+    time_points = [s.split("_")[3] for s in x_axis_previous]
+
+    fig, ax = plt.subplots(len(proteins), len(cell_lines), figsize=(4 * len(cell_lines), 2 * len(proteins)))
+
+    if len(proteins) == 1:
+        ax = [ax]  # Handle case of single protein correctly
+
+    for c, protein in enumerate(proteins):
+        # Subset the DataFrame
+        if protein in df['protein_name'].values:
+            sub_df = df[df['protein_name'] == protein].copy()
+        elif protein in df['protein_Id'].values:
+            sub_df = df[df['protein_Id'] == protein].copy()
+        else:
+            print(f"The protein {protein} is not present in the dataset.")
+            continue
+
+        # print(f"Plotting sites of protein {protein}")
+######
+        protein_for_url = str(sub_df['protein_Id'].values[0])
+        prot_name = str(sub_df['protein_name'].values[0])
+        uniprot_url = f"https://www.uniprot.org/uniprotkb/{protein_for_url}"
+        html_link = f'Plotting sites of protein <a href="{uniprot_url}" target="_blank">{protein_for_url}</a> {prot_name}'
+        display(HTML(html_link))
+######
+        saving_folder = f"{sub_df['protein_name'].values[0]}_{sub_df['protein_Id'].values[0]}"
+        sub_df.sort_values(by=['site'], inplace=True)
+
+        for _, row in sub_df.iterrows():
+            for ci, cell in enumerate(cell_lines):  # ✅ ci maps cell to column index
+                ax[c][ci].plot(time_points, row[columns_dir[cell][conditions[0]]])
+                ax[c][ci].set_title(cell)
+                ax[c][ci].axhline(0, color='black', linestyle='--', linewidth=0.5)
+
+        # Y-axis limits
+        all_conditions = [col for cell in cell_lines for col in columns_dir[cell]["_EGF_"]]
+        sub_values_df = sub_df[all_conditions]
+        y_max = sub_values_df.max().max() * 1.05 + 0.1
+        y_min_val = sub_values_df.min().min()
+        y_min = y_min_val * 0.95 - 0.1 if y_min_val >= 0 else -abs(y_min_val) * 1.05 - 0.1
+
+        for i in range(3):
+            ax[c][i].set_ylim(y_min, y_max)
+        ax[c][0].set_ylabel(f"{saving_folder}\n{data_type}")
+
+    if legend == True:
+        fig.legend(labels=df["site"].unique())
+
+    fig.tight_layout()
+
+    # Save
+    if save_pdf:
+        plt.savefig(os.path.join(saving_path, f"{saving_info}.pdf"))
+    if save_png:
+        plt.savefig(os.path.join(saving_path, f"{saving_info}.png"))
+    if not save_pdf and not save_png:
+        print(f"{saving_info} Plot not saved")
+
+    plt.show()
+
+
