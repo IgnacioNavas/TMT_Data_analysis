@@ -2538,7 +2538,7 @@ def tslearn_clustering_KMeans_mutants(df_to_cluster,
         return df_to_cluster
 
 #%%
-def clusters_plot_linear_mutants(
+def clusters_plot_linear_mutants( # it works, but i think i need ot refine it a bit
     df,
     legend=list,
     saving_path=str,
@@ -2555,7 +2555,7 @@ def clusters_plot_linear_mutants(
     save_pdf=False,
     save_png=False,
     plot_close=False,
-    y_lims_list=False,
+    fit_y_lims=False,
     grey_alpha=0.08,
     grey_lw=0.8,
     mean_lw=2.6):
@@ -2594,17 +2594,20 @@ def clusters_plot_linear_mutants(
 
     # Build column lookup
     columns_dir = {condition: {cell: {} for cell in cell_lines} for condition in conditions}
+    column_selection = []
     sub_dtp = data_type.split(":")
 
     for condition in conditions:
         for cell in cell_lines:
-            columns_dir[condition][cell]["plotting"] = [
+            values = [
                 col for col in column_names
                 if col.startswith(cell)
                 and condition in col
                 and sub_dtp[0] in col
                 and sub_dtp[1] in col
             ]
+            columns_dir[condition][cell]["plotting"] = values
+            column_selection = column_selection + values
     # print(columns_dir)
 
     fig, axes = plt.subplots(
@@ -2616,6 +2619,26 @@ def clusters_plot_linear_mutants(
 
     for r, cluster in enumerate(sorted_clusters):
         sub_df = df.loc[df[cluster_column] == cluster].copy()
+
+        # Resolve y-axis limits up front
+        if isinstance(fit_y_lims, list):
+            y_lim_min, y_lim_max = fit_y_lims[0], fit_y_lims[1]
+            y_limt_info = f"_y_axis_fixed_{y_lim_min}_{y_lim_max}"
+            use_fixed_ylims = True
+        elif fit_y_lims is False:
+            sub_values_df = sub_df[column_selection] if column_selection else pd.DataFrame()
+            if not sub_values_df.empty:
+                y_lim_max = sub_values_df.max().max() * 1.02
+                y_lim_min = sub_values_df.min().min()
+                y_lim_min = y_lim_min + y_lim_min * 0.1 if y_lim_min < 0 else y_lim_min * 0.97
+            else:
+                y_lim_min, y_lim_max = None, None
+            use_fixed_ylims = False
+            y_limt_info = ""
+        else:  # fit_y_lims is True -> per-row dynamic limits
+            use_fixed_ylims = None  # signals "compute per row"
+            y_limt_info = "y_axis_perrow"
+
         if sub_df.shape[0] == 0:
             continue
         # print(cell_lines)
@@ -2636,6 +2659,22 @@ def clusters_plot_linear_mutants(
 
             ax.axhline(0, color="grey", linestyle="--", linewidth=1)
             ax.grid(True, alpha=0.3)
+
+            # Apply y-limits
+            # if use_fixed_ylims is None:  # per-row dynamic
+            #     df_val = sub_values_df[cond_cols].to_numpy(dtype=float)
+            #     row_vals = row[column_selection].dropna() if column_selection else pd.Series()
+            #
+            #     if not row_vals.empty:
+            #         rmin, rmax = row_vals.min(), row_vals.max()
+            #         pad_min = rmin + rmin * 0.1 if rmin < 0 else rmin * 0.9
+            #         ax.set_ylim(pad_min, rmax * 1.1)
+            # elif use_fixed_ylims and y_lim_min is not None:
+            #     axes[i, j].set_ylim(y_lim_min, y_lim_max)
+            # elif not use_fixed_ylims and y_lim_min is not None:
+            ax.set_ylim(y_lim_min, y_lim_max)
+
+            ax.set_xlim(-1, 4)
 
             if r == n_cluster - 1:
                 ax.set_xlabel("Time (min)")
