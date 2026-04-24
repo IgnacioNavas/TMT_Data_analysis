@@ -1,4 +1,4 @@
-# TMT_Data_analysis
+# TMT_Data_analysis (msms_TdYSre (Temporal Dynamics Signaling Regulation))
 
 Wellcome this repository makes the data processing and data analysis from the "The functional crosstalk between EGF and 
 insulin signalling" project in Prof. Dr. Tina Perica lab. 
