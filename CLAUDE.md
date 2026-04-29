@@ -1,5 +1,6 @@
-# The MAPK/ERK signaling pathway crosstalk and regulation at phosphoproteome level
+# Project: The MAPK/ERK signaling pathway crosstalk and regulation at phosphoproteome level
 
+## Project overview
 This project aims to understand how cells use phosphorylation of Serine, Threonine and Tyrosine residues to transduce 
 signal information in order to generate an adecuate response. For this hTERT-HME1 and HEK293T cell lines are being used.
 I am putting my main effort tin the regulation of the MAPK/ERK sinaling pathway, and the crosstalk between EGF and 
@@ -24,11 +25,15 @@ controls.
 The phosphoproteomics data collected from the wild type cell lines (hTERT-HEM1 and HEK293T) where done using TMT-LC-MS/MS
 and the data from the mutants was collected using LFQ-LC-MS/MS. 
 
-## Data structure
+## Repository structure
+
+The structure of the repository is still not define, it is chaotic. However, the main code for running is in this project folder.
+
+## Naming conventions and Data structure
 
 Not all the datasets have the following labeling sistem but this will be the code use for it. These will be the labeling 
 methodology for the data (columns)
- - samples label: (CellLine)_(DataType)_(Treatment)_(TimePoint)_(Replicate)
+ - samples label: (CellLine)_ (DataType)_ (Treatment)_ (TimePoint)_ (Replicate)
    - Cell lines examples: WT or BRAFS151A
    - Data type: it has several caracteristics separated by ":" like "raw:abs" or "log2:mean". 
      - The first term will be if the numbers represent the raw absorbance detected by the spectrometer (raw) or if this data has been transformed (usually log2 transformations) (log2)
@@ -59,7 +64,7 @@ transformations, there is data corresponding to other parameters like:
  - protein_ID: uniprot ID of the protein teh peptide belongs
  - etc.,
 
-## Data analsys overview
+## Data analysis overview
 
 To analyze this data I am planing to cluster the temporal dynamics the phosphorylated peptides can adopt. Phosphorylated
 peptides with similar temporal dynamics should cluster together. For the clustering I want to consider each stimulation
@@ -72,4 +77,20 @@ changed and its function was not necessary to buffer the perturbation introduced
 cluster thant the same peptide used to train the model, then the time profile has changed and either the peptide was 
 needed to buffer the preturbation introduced or is being affected by the perturbation.
 
+
+## Current status
+
+I think initial quality controls of the data are missing in some points
+
+There are many functions working but they are un-structured and need to be ajusted so it works with all datasets.
+
+Clustering functions are working.However, clustering need to be further optimized.
+
+Clustering labes have not been used yet to train any classification model.
+
+## Important rules
+ - Always add documentation to new code to better understand what it does
+ - If needed add documentation to old code
+ - Never overwrite .csv or .xlsx files, always add tracking number at the end or a word that explains the new modification
+ - 
 

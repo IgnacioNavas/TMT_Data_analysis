@@ -2,10 +2,10 @@
 # Ignore folders
 ############################
 ./claude
+./Claude_promts
 ./Experiment/*
 ./External_Data/*
 #./notebooks
-./Old_code
 ./PhosX
 #./scripts
 ./Server_results

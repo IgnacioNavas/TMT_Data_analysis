@@ -1,0 +1,6 @@
+# Data
+./Experiment/
+
+# Credentials and secrets
+.env
+*.key
