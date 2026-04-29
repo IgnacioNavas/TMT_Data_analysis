@@ -15,8 +15,8 @@
 # Ignore files
 ############################
 
-.gitignore
-.claudeignore
+gitignore
+claudeignore
 CLAUDE.md
 claude_history.txt
 environment_202602.yml
