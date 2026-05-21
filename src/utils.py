@@ -1655,202 +1655,206 @@ def kernnel_clustering(df_to_cluster,
 # Cluster quality / similarity metrics
 # =============================================================================
 
-def cluster_similarity_cdist_dtw(
-        df,
-        transpose=True,
-        data_type="log2_FC",
-        cluster_column_name="",
-        mean=True,
-        median=False,
-        verbose=False
-):
-    '''
-    DTW distance between peptides' full multivariate time series within each cluster.
-    Returns a dict {cluster: mean/median DTW distance}.
-    '''
-    column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
-
-    cluster_metric = {}
-
-    for cluster in sorted(df[cluster_column_name].unique()):
-        if cluster == 999:
-            continue
-        df1 = df.loc[df[cluster_column_name] == cluster]
-        X1_tp, y_qc = reshape_df(df=df1, time_series=column_selection, labels="site", dimensions=3, len_time_serie=7,
-                                  transpose=transpose, verbose=verbose)
-
-        dist_tp = tsl.metrics.cdist_dtw(dataset1=X1_tp)
-        if mean == True and median == False:
-            mean_dtw_tp = np.mean(dist_tp[np.triu_indices_from(dist_tp, k=1)])
-            cluster_metric[cluster] = mean_dtw_tp
-        elif mean == False and median == True:
-            median_dtw_tp = np.median(dist_tp[np.triu_indices_from(dist_tp, k=1)])
-            cluster_metric[cluster] = median_dtw_tp
-        else:
-            print("Select mean or median")
-
-    return cluster_metric
-
-
-def mean_dtw_within_cluster_per_condition(X_time_cond):
-    """
-    X_time_cond: (n_peptides, n_timepoints, 3) where dim 0..2 are conditions.
-    Returns dict with mean DTW per condition.
-    """
-    out = {}
-    for cond_i, cond_name in enumerate(["EGF", "INS", "EGFnINS"]):
-        Xc = X_time_cond[:, :, cond_i][:, :, None]
-        D = cdist_dtw(Xc)
-        out[cond_name] = float(np.mean(D[np.triu_indices_from(D, k=1)]))
-    return out
+# def cluster_similarity_cdist_dtw(
+#         df,
+#         transpose=True,
+#         data_type="log2_FC",
+#         cluster_column_name="",
+#         mean=True,
+#         median=False,
+#         verbose=False
+# ):
+#     '''
+#     DTW distance between peptides' full multivariate time series within each cluster.
+#     Returns a dict {cluster: mean/median DTW distance}.
+#     '''
+#     column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
+#
+#     cluster_metric = {}
+#
+#     for cluster in sorted(df[cluster_column_name].unique()):
+#         if cluster == 999:
+#             continue
+#         df1 = df.loc[df[cluster_column_name] == cluster]
+#         X1_tp, y_qc = reshape_df(df=df1,
+#                                  time_series=column_selection,
+#                                  labels="site", dimensions=3,
+#                                  len_time_serie=7,
+#                                   transpose=transpose,
+#                                  verbose=verbose)
+#
+#         dist_tp = tsl.metrics.cdist_dtw(dataset1=X1_tp)
+#         if mean == True and median == False:
+#             mean_dtw_tp = np.mean(dist_tp[np.triu_indices_from(dist_tp, k=1)])
+#             cluster_metric[cluster] = mean_dtw_tp
+#         elif mean == False and median == True:
+#             median_dtw_tp = np.median(dist_tp[np.triu_indices_from(dist_tp, k=1)])
+#             cluster_metric[cluster] = median_dtw_tp
+#         else:
+#             print("Select mean or median")
+#
+#     return cluster_metric
 
 
-def cluster_similarity_per_condition(
-        df,
-        transpose=True,
-        data_type="log2_FC",
-        cluster_column_name="",
-        mean=True,
-        median=False,
-        verbose=False
-):
-    '''Computes mean DTW per condition (one scalar per condition per cluster).'''
-    column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
-
-    cluster_metric = {}
-
-    for cluster in sorted(df[cluster_column_name].unique()):
-        if cluster == 999:
-            continue
-        df1 = df.loc[df[cluster_column_name] == cluster]
-        X1_tp, y_qc = reshape_df(df=df1, time_series=column_selection, labels="site", dimensions=3, len_time_serie=7,
-                                  transpose=transpose, verbose=verbose)
-
-        dist_per_condition = mean_dtw_within_cluster_per_condition(X1_tp)
-        cluster_metric[cluster] = dist_per_condition
-
-    return cluster_metric
+# def mean_dtw_within_cluster_per_condition(X_time_cond):
+#     """
+#     X_time_cond: (n_peptides, n_timepoints, 3) where dim 0..2 are conditions.
+#     Returns dict with mean DTW per condition.
+#     """
+#     out = {}
+#     for cond_i, cond_name in enumerate(["EGF", "INS", "EGFnINS"]):
+#         Xc = X_time_cond[:, :, cond_i][:, :, None]
+#         D = cdist_dtw(Xc)
+#         out[cond_name] = float(np.mean(D[np.triu_indices_from(D, k=1)]))
+#     return out
 
 
-def timepoint_pairwise_distances_within_condition(X_time_cond, summary="mean"):
-    """
-    X_time_cond: (n_peptides, n_timepoints, 3) where last axis is conditions.
-    Computes pairwise distances between peptides at each timepoint, per condition.
-
-    Returns:
-      dict cond -> (T,) mean/median upper-triangle distance per timepoint
-    """
-    X = np.asarray(X_time_cond)
-    n, T, C = X.shape
-    cond_names = ["EGF", "INS", "EGFnINS"]
-
-    results = {}
-
-    for c in range(C):
-        M = X[:, :, c]
-        summary_t = np.full(T, np.nan, dtype=float)
-        if n < 2:
-            results[cond_names[c]] = summary_t
-            continue
-
-        iu = np.triu_indices(n, k=1)
-
-        for t in range(T):
-            v = M[:, t][:, None]
-            Dt = np.abs(v - v.T)
-            tri = Dt[iu]
-            if summary == "mean":
-                summary_t[t] = float(np.mean(tri))
-            elif summary == "median":
-                summary_t[t] = float(np.median(tri))
-            else:
-                raise ValueError("summary must be 'mean' or 'median'")
-
-        results[cond_names[c]] = summary_t
-
-    return results
+# def cluster_similarity_per_condition(
+#         df,
+#         transpose=True,
+#         data_type="log2_FC",
+#         cluster_column_name="",
+#         mean=True,
+#         median=False,
+#         verbose=False
+# ):
+#     '''Computes mean DTW per condition (one scalar per condition per cluster).'''
+#     column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
+#
+#     cluster_metric = {}
+#
+#     for cluster in sorted(df[cluster_column_name].unique()):
+#         if cluster == 999:
+#             continue
+#         df1 = df.loc[df[cluster_column_name] == cluster]
+#         X1_tp, y_qc = reshape_df(df=df1, time_series=column_selection, labels="site", dimensions=3, len_time_serie=7,
+#                                   transpose=transpose, verbose=verbose)
+#
+#         dist_per_condition = mean_dtw_within_cluster_per_condition(X1_tp)
+#         cluster_metric[cluster] = dist_per_condition
+#
+#     return cluster_metric
 
 
-def cluster_similarity_per_condition_per_timepoint(
-        df,
-        transpose=True,
-        data_type="log2_FC",
-        cluster_column_name="",
-        mean=True,
-        median=False,
-        verbose=False
-):
-    '''Computes mean pairwise distance per condition and time point (one array per condition per cluster).'''
-    column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
-
-    cluster_metric = {}
-
-    for cluster in sorted(df[cluster_column_name].unique()):
-        if cluster == 999:
-            continue
-        df1 = df.loc[df[cluster_column_name] == cluster]
-        X1_tp, y_qc = reshape_df(df=df1, time_series=column_selection, labels="site", dimensions=3, len_time_serie=7,
-                                  transpose=transpose, verbose=verbose)
-
-        dist_per_condition = timepoint_pairwise_distances_within_condition(X1_tp, summary="mean")
-        cluster_metric[cluster] = dist_per_condition
-
-    return cluster_metric
-
-
-def combine_conditions(scores_per_cluster, how="mean", cond_order=("EGF", "INS", "EGFnINS")):
-    """Collapse per-condition scores into a single scalar per cluster."""
-    combined = {}
-    for k, d in scores_per_cluster.items():
-        vals = np.array([d[c] for c in cond_order], dtype=float)
-        if how == "mean":
-            combined[k] = float(np.nanmean(vals))
-        elif how == "max":
-            combined[k] = float(np.nanmax(vals))
-        elif how == "median":
-            combined[k] = float(np.nanmedian(vals))
-        else:
-            raise ValueError("how must be 'mean', 'median', or 'max'")
-    return combined
+# def timepoint_pairwise_distances_within_condition(X_time_cond, summary="mean"):
+#     """
+#     X_time_cond: (n_peptides, n_timepoints, 3) where last axis is conditions.
+#     Computes pairwise distances between peptides at each timepoint, per condition.
+#
+#     Returns:
+#       dict cond -> (T,) mean/median upper-triangle distance per timepoint
+#     """
+#     X = np.asarray(X_time_cond)
+#     n, T, C = X.shape
+#     cond_names = ["EGF", "INS", "EGFnINS"]
+#
+#     results = {}
+#
+#     for c in range(C):
+#         M = X[:, :, c]
+#         summary_t = np.full(T, np.nan, dtype=float)
+#         if n < 2:
+#             results[cond_names[c]] = summary_t
+#             continue
+#
+#         iu = np.triu_indices(n, k=1)
+#
+#         for t in range(T):
+#             v = M[:, t][:, None]
+#             Dt = np.abs(v - v.T)
+#             tri = Dt[iu]
+#             if summary == "mean":
+#                 summary_t[t] = float(np.mean(tri))
+#             elif summary == "median":
+#                 summary_t[t] = float(np.median(tri))
+#             else:
+#                 raise ValueError("summary must be 'mean' or 'median'")
+#
+#         results[cond_names[c]] = summary_t
+#
+#     return results
 
 
-def clusters_shared_peptides(
-    cluster_df,
-    clustering_1: str,
-    clustering_2: str,
-    site: str = None,
-    clusters=None
-):
-    """
-    Plot a Venn diagram of sites shared between two cluster assignments.
-    Provide either `site` (to infer cluster IDs automatically) or explicit `clusters=[id1, id2]`.
-    """
-    if clusters is None:
-        clusters = [None, None]
+# def cluster_similarity_per_condition_per_timepoint(
+#         df,
+#         transpose=True,
+#         data_type="log2_FC",
+#         cluster_column_name="",
+#         mean=True,
+#         median=False,
+#         verbose=False
+# ):
+#     '''Computes mean pairwise distance per condition and time point (one array per condition per cluster).'''
+#     column_selection = [element for element in df.columns.tolist() if f"{data_type}" in element and "cluster" not in element]
+#
+#     cluster_metric = {}
+#
+#     for cluster in sorted(df[cluster_column_name].unique()):
+#         if cluster == 999:
+#             continue
+#         df1 = df.loc[df[cluster_column_name] == cluster]
+#         X1_tp, y_qc = reshape_df(df=df1, time_series=column_selection, labels="site", dimensions=3, len_time_serie=7,
+#                                   transpose=transpose, verbose=verbose)
+#
+#         dist_per_condition = timepoint_pairwise_distances_within_condition(X1_tp, summary="mean")
+#         cluster_metric[cluster] = dist_per_condition
+#
+#     return cluster_metric
 
-    if site:
-        row = cluster_df.loc[cluster_df["site"] == site, [clustering_1, clustering_2]]
-        if row.empty:
-            raise ValueError(f"Site '{site}' not found in cluster_df['site'].")
-        cluster1_id = row.iloc[0][clustering_1]
-        cluster2_id = row.iloc[0][clustering_2]
-    else:
-        if len(clusters) != 2:
-            raise ValueError("`clusters` must be a list/tuple of length 2: [cluster1_id, cluster2_id].")
-        cluster1_id, cluster2_id = clusters
-        if cluster1_id is None or cluster2_id is None:
-            raise ValueError("Provide `site` or both cluster IDs in `clusters=[cluster1_id, cluster2_id]`.")
 
-    set_1 = set(cluster_df.loc[cluster_df[clustering_1] == cluster1_id, "site"].tolist())
-    set_2 = set(cluster_df.loc[cluster_df[clustering_2] == cluster2_id, "site"].tolist())
-
-    plt.figure(figsize=(6, 4))
-    venn2(
-        [set_1, set_2],
-        set_labels=(f"{clustering_1}\nCluster {cluster1_id}", f"{clustering_2}\nCluster {cluster2_id}")
-    )
-    plt.title("Venn Diagram")
-    plt.show()
+# def combine_conditions(scores_per_cluster, how="mean", cond_order=("EGF", "INS", "EGFnINS")):
+#     """Collapse per-condition scores into a single scalar per cluster."""
+#     combined = {}
+#     for k, d in scores_per_cluster.items():
+#         vals = np.array([d[c] for c in cond_order], dtype=float)
+#         if how == "mean":
+#             combined[k] = float(np.nanmean(vals))
+#         elif how == "max":
+#             combined[k] = float(np.nanmax(vals))
+#         elif how == "median":
+#             combined[k] = float(np.nanmedian(vals))
+#         else:
+#             raise ValueError("how must be 'mean', 'median', or 'max'")
+#     return combined
+#
+#
+# def clusters_shared_peptides(
+#     cluster_df,
+#     clustering_1: str,
+#     clustering_2: str,
+#     site: str = None,
+#     clusters=None
+# ):
+#     """
+#     Plot a Venn diagram of sites shared between two cluster assignments.
+#     Provide either `site` (to infer cluster IDs automatically) or explicit `clusters=[id1, id2]`.
+#     """
+#     if clusters is None:
+#         clusters = [None, None]
+#
+#     if site:
+#         row = cluster_df.loc[cluster_df["site"] == site, [clustering_1, clustering_2]]
+#         if row.empty:
+#             raise ValueError(f"Site '{site}' not found in cluster_df['site'].")
+#         cluster1_id = row.iloc[0][clustering_1]
+#         cluster2_id = row.iloc[0][clustering_2]
+#     else:
+#         if len(clusters) != 2:
+#             raise ValueError("`clusters` must be a list/tuple of length 2: [cluster1_id, cluster2_id].")
+#         cluster1_id, cluster2_id = clusters
+#         if cluster1_id is None or cluster2_id is None:
+#             raise ValueError("Provide `site` or both cluster IDs in `clusters=[cluster1_id, cluster2_id]`.")
+#
+#     set_1 = set(cluster_df.loc[cluster_df[clustering_1] == cluster1_id, "site"].tolist())
+#     set_2 = set(cluster_df.loc[cluster_df[clustering_2] == cluster2_id, "site"].tolist())
+#
+#     plt.figure(figsize=(6, 4))
+#     venn2(
+#         [set_1, set_2],
+#         set_labels=(f"{clustering_1}\nCluster {cluster1_id}", f"{clustering_2}\nCluster {cluster2_id}")
+#     )
+#     plt.title("Venn Diagram")
+#     plt.show()
 
 
 # =============================================================================
@@ -1886,22 +1890,23 @@ def plot_graph(G, title="Directed Network"):
 # Visualisation helpers
 # =============================================================================
 
-def plot_grouped_bars(scores, cond_order=("EGF", "INS", "EGFnINS"), figsize=(14, 5)):
-    '''Plot per-cluster, per-condition dispersion scores as a grouped bar chart.'''
-    clusters = sorted(scores.keys())
-    x = np.arange(len(clusters))
-    width = 0.25
-
-    plt.figure(figsize=figsize)
-
-    for i, cond in enumerate(cond_order):
-        y = [scores[c][cond] for c in clusters]
-        plt.bar(x + (i - (len(cond_order) - 1) / 2) * width, y, width=width, label=cond)
-
-    plt.xticks(x, clusters, rotation=90)
-    plt.xlabel("Cluster")
-    plt.ylabel("Dispersion score (lower = tighter)")
-    plt.title("Cluster quality per condition")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+# Moved to src/plotting_functions.py as plot_cluster_scores() — improved version
+# def plot_grouped_bars(scores, cond_order=("EGF", "INS", "EGFnINS"), figsize=(14, 5)):
+#     '''Plot per-cluster, per-condition dispersion scores as a grouped bar chart.'''
+#     clusters = sorted(scores.keys())
+#     x = np.arange(len(clusters))
+#     width = 0.25
+#
+#     plt.figure(figsize=figsize)
+#
+#     for i, cond in enumerate(cond_order):
+#         y = [scores[c][cond] for c in clusters]
+#         plt.bar(x + (i - (len(cond_order) - 1) / 2) * width, y, width=width, label=cond)
+#
+#     plt.xticks(x, clusters, rotation=90)
+#     plt.xlabel("Cluster")
+#     plt.ylabel("Dispersion score (lower = tighter)")
+#     plt.title("Cluster quality per condition")
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.show()

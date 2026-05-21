@@ -10,12 +10,12 @@
 #./scripts
 ./Server_results
 #./src
+./Old
 
 ############################
 # Ignore files
 ############################
 
-gitignore
 claudeignore
 CLAUDE.md
 claude_history.txt

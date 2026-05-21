@@ -97,24 +97,30 @@ class ColumnSpec:
     def timepoints_from(
         cls,
         df: pd.DataFrame,
-        cell_line: str,
+        cell_line: "str | List[str]",
         data_type: str,
-        condition: str,
+        condition: "str | List[str]",
     ) -> List[str]:
         """
         Infer the ordered list of timepoint labels present in *df* for the given spec.
 
+        Accepts either a single string or a list for cell_line and condition.
         Returns labels extracted from the 4th underscore-delimited field of matching
-        column names (index 3), preserving column order.
+        column names (index 3), preserving column order and deduplicating.
         """
-        spec = cls(cell_line=cell_line, data_type=data_type, condition=condition)
-        matched = [c for c in df.columns if spec.matches(c)]
+        cell_lines = [cell_line] if isinstance(cell_line, str) else cell_line
+        conditions = [condition] if isinstance(condition, str) else condition
+
         seen: dict = {}
-        for col in matched:
-            parts = col.split("_")
-            if len(parts) >= 4:
-                tp = parts[3]
-                seen[tp] = None  # use dict to preserve insertion order & deduplicate
+        for cell in cell_lines:
+            for cond in conditions:
+                spec = cls(cell_line=cell, data_type=data_type, condition=cond)
+                matched = [c for c in df.columns if spec.matches(c)]
+                for col in matched:
+                    parts = col.split("_")
+                    if len(parts) >= 4:
+                        tp = parts[3]
+                        seen[tp] = None  # use dict to preserve insertion order & deduplicate
         return list(seen.keys())
 
 
