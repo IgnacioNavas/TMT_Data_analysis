@@ -40,7 +40,13 @@ def plot_data(ax,
     x_axis_previous = [element for element in column_names if f"{cell_lines[0]}_{data_type}{conditions[0]}" in element]
     x_axis = [s.split("_")[3] for s in x_axis_previous]
 
-    site = row_df["site"].split("~")[0]
+    _site_parts = row_df["site"].split("~")
+    _site_id = _site_parts[0]
+    # site_index is "nan" (string) when no STY modification was localised in LFQ data
+    if _site_id.lower() == "nan" or _site_id == "":
+        site = _site_parts[1] if len(_site_parts) > 1 else row_df["site"]
+    else:
+        site = _site_id
     prot_name = row_df["protein_name"]
     protein_ID = row_df["protein_Id"]
     n_rep = row_df["n:reps"] if "n:reps" in row_df.index else ""

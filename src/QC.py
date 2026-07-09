@@ -126,7 +126,7 @@ def peptide_count_per_sample(df,
         cell_lines: list of cell-line prefixes.
         conditions: list of condition substrings.
         data_type: default "raw:abs".
-        missing_value: value treated as undetected (default 0.0).
+        missing_value: value treated as undetected (default 0.0); NaN is always missing.
         figsize: (width, height).
         title: figure title.
         ax: optional Axes.
@@ -144,7 +144,9 @@ def peptide_count_per_sample(df,
     if not cols:
         raise ValueError("No replicate columns found.")
 
-    counts = (df[cols] != missing_value).sum() # Assuming 0.0 as missing value, not sure if it recognices NaN as missing value
+    # A site is detected only if it is neither NaN nor the missing sentinel (default 0.0).
+    # Handles both NaN-based and 0-based missing encodings, matching replicate_detection_map.
+    counts = (df[cols].notna() & (df[cols] != missing_value)).sum()
 
     if figsize is None:
         figsize = (max(8, len(cols) * 0.5), 5)
@@ -692,6 +694,7 @@ def pca_plot_interactive(
     impute=True,
     impute_method="mean",
     color_by="condition",
+    symbol_by="stimulation",
     figsize=(1000, 800),
     title="PCA of replicate samples",
 ):
@@ -699,8 +702,14 @@ def pca_plot_interactive(
     Interactive Plotly PCA scatter plot of replicate samples.
 
     Samples (replicates) are the observations; phosphosites are the features.
-    Points are coloured by condition group and shaped by stimulation type
-    (EGF = diamond, INS = square, EGFnINS = cross, controls = circle).
+    Points are coloured according to `color_by` and shaped according to
+    `symbol_by`. By default colour = condition×timepoint group and marker =
+    stimulation type (EGF = diamond, INS = square, EGFnINS = cross,
+    controls = circle). For the mutant datasets (only EGF stimulation, several
+    cell lines) the useful combination is color_by="cell_line",
+    symbol_by="timepoint": every point coloured by its cell line and shaped by
+    its timepoint. With the default symbol_by="stimulation" the mutant samples
+    would all share one marker (all EGF), hiding the timepoints.
 
     A separate bar chart of variance explained per PC is also returned.
 
@@ -717,6 +726,10 @@ def pca_plot_interactive(
         impute_method: "mean" or "median", passed to impute_missing_replicates().
         color_by: "condition" (default) — colour by condition×timepoint group;
                   "cell_line" — colour by cell-line prefix.
+        symbol_by: what the marker shape encodes:
+                   "stimulation" (default) — EGF/INS/EGFnINS/control marker;
+                   "timepoint" — one marker per timepoint (full, starve, 2, ...);
+                   "condition" — one marker per condition×timepoint group.
         figsize: (width, height) in pixels for the Plotly figure.
         title: figure title.
 
@@ -764,8 +777,13 @@ def pca_plot_interactive(
         base = _REP_RE.sub("", col)           # e.g. WT_raw:abs_EGF_full
         return "_".join(base.split("_")[2:])  # e.g. EGF_full
 
-    # Derive symbol from condition label
-    def _symbol(label):
+    def _timepoint_label(col):
+        # Timepoint is the last token of the base name, e.g. WT_raw:abs_EGF_2 -> "2"
+        base = _REP_RE.sub("", col)
+        return base.split("_")[-1]
+
+    # Derive marker from stimulation type in the condition label
+    def _stimulation_symbol(label):
         if "EGFnINS" in label:
             return "cross"
         elif "EGF" in label:
@@ -775,6 +793,7 @@ def pca_plot_interactive(
         return "circle"
 
     pca_df["condition"] = pca_df["sample"].apply(_cond_label)
+    pca_df["timepoint"] = pca_df["sample"].apply(_timepoint_label)
 
     if color_by == "cell_line":
         def _cell_label(col):
@@ -786,7 +805,13 @@ def pca_plot_interactive(
     else:
         pca_df["color_group"] = pca_df["condition"]
 
-    pca_df["symbol"] = pca_df["condition"].apply(_symbol)
+    # Marker shape encodes whatever symbol_by selects
+    if symbol_by == "timepoint":
+        pca_df["symbol"] = pca_df["timepoint"]
+    elif symbol_by == "condition":
+        pca_df["symbol"] = pca_df["condition"]
+    else:  # "stimulation" (default)
+        pca_df["symbol"] = pca_df["condition"].apply(_stimulation_symbol)
 
     # --- Scatter: PC1 vs PC2 ---
     var_pct = pca.explained_variance_ratio_ * 100
@@ -796,13 +821,15 @@ def pca_plot_interactive(
         color="color_group",
         symbol="symbol",
         hover_name="sample",
-        hover_data={"condition": True, "PC1": ":.2f", "PC2": ":.2f",
+        hover_data={"condition": True, "timepoint": True,
+                    "PC1": ":.2f", "PC2": ":.2f",
                     "color_group": False, "symbol": False},
         title=title,
         labels={
             "PC1": f"PC1 ({var_pct[0]:.1f}% var)",
             "PC2": f"PC2 ({var_pct[1]:.1f}% var)",
             "color_group": color_by,
+            "symbol": symbol_by,
         },
         width=figsize[0], height=figsize[1],
     )
@@ -841,6 +868,7 @@ def umap_plot_interactive(
     min_dist=0.1,
     random_state=42,
     color_by="condition",
+    symbol_by="stimulation",
     figsize=(1000, 800),
     title="UMAP of replicate samples",
 ):
@@ -851,8 +879,27 @@ def umap_plot_interactive(
     This is the UMAP equivalent of pca_plot_interactive(): the same matrix is
     embedded with UMAP instead of PCA.
 
-    Points are coloured by condition group and shaped by stimulation type
-    (EGF = diamond, INS = square, EGFnINS = cross, controls = circle).
+    Points are coloured according to `color_by` and shaped according to
+    `symbol_by`. By default colour = condition×timepoint group and marker =
+    stimulation type (EGF = diamond, INS = square, EGFnINS = cross,
+    controls = circle). For the mutant datasets (only EGF stimulation, several
+    cell lines) the useful combination is color_by="cell_line",
+    symbol_by="timepoint": every point coloured by its cell line and shaped by
+    its timepoint. With the default symbol_by="stimulation" the mutant samples
+    would all share one marker (all EGF), hiding the timepoints.
+
+    NOTE — identical/duplicated samples do NOT co-locate in UMAP.
+    UMAP is a stochastic, graph-based force-directed layout: every sample is a
+    separate node, and negative sampling (repulsion) can push even byte-for-byte
+    identical points apart, regardless of `random_state`. In this project the
+    `full` and `starve` timepoints are duplicated across the EGF/INS/EGFnINS
+    conditions (they are the same physical samples), so they will appear
+    SEPARATED here even though their feature vectors are identical. This is an
+    artifact of the algorithm, not a data or imputation problem. To check that
+    replicates of a timepoint agree (i.e. that identical samples overlap), use
+    pca_plot_interactive() instead — PCA is a deterministic linear projection
+    that maps identical vectors to the exact same coordinate. Use UMAP only for
+    exploring non-linear grouping structure, not for exact-overlap QC.
 
     Args:
         df: DataFrame following the project naming convention.
@@ -868,6 +915,10 @@ def umap_plot_interactive(
         random_state: random seed for reproducibility (default 42).
         color_by: "condition" (default) — colour by condition×timepoint group;
                   "cell_line" — colour by cell-line prefix.
+        symbol_by: what the marker shape encodes:
+                   "stimulation" (default) — EGF/INS/EGFnINS/control marker;
+                   "timepoint" — one marker per timepoint (full, starve, 2, ...);
+                   "condition" — one marker per condition×timepoint group.
         figsize: (width, height) in pixels for the Plotly figure (default (1000, 800)).
         title: figure title.
 
@@ -916,7 +967,12 @@ def umap_plot_interactive(
         base = _REP_RE.sub("", col)
         return "_".join(base.split("_")[2:])
 
-    def _symbol(label):
+    def _timepoint_label(col):
+        # Timepoint is the last token of the base name, e.g. WT_raw:abs_EGF_2 -> "2"
+        base = _REP_RE.sub("", col)
+        return base.split("_")[-1]
+
+    def _stimulation_symbol(label):
         if "EGFnINS" in label:
             return "cross"
         elif "EGF" in label:
@@ -926,6 +982,7 @@ def umap_plot_interactive(
         return "circle"
 
     umap_df["condition"] = umap_df["sample"].apply(_cond_label)
+    umap_df["timepoint"] = umap_df["sample"].apply(_timepoint_label)
 
     if color_by == "cell_line":
         def _cell_label(col):
@@ -937,7 +994,13 @@ def umap_plot_interactive(
     else:
         umap_df["color_group"] = umap_df["condition"]
 
-    umap_df["symbol"] = umap_df["condition"].apply(_symbol)
+    # Marker shape encodes whatever symbol_by selects
+    if symbol_by == "timepoint":
+        umap_df["symbol"] = umap_df["timepoint"]
+    elif symbol_by == "condition":
+        umap_df["symbol"] = umap_df["condition"]
+    else:  # "stimulation" (default)
+        umap_df["symbol"] = umap_df["condition"].apply(_stimulation_symbol)
 
     # --- Scatter: UMAP1 vs UMAP2 ---
     fig_scatter = px.scatter(
@@ -946,10 +1009,11 @@ def umap_plot_interactive(
         color="color_group",
         symbol="symbol",
         hover_name="sample",
-        hover_data={"condition": True, "UMAP1": ":.2f", "UMAP2": ":.2f",
+        hover_data={"condition": True, "timepoint": True,
+                    "UMAP1": ":.2f", "UMAP2": ":.2f",
                     "color_group": False, "symbol": False},
         title=title,
-        labels={"color_group": color_by},
+        labels={"color_group": color_by, "symbol": symbol_by},
         width=figsize[0], height=figsize[1],
     )
     fig_scatter.update_traces(marker=dict(size=12, line=dict(width=1.2, color="DarkSlateGrey")))

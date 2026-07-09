@@ -615,8 +615,7 @@ def run_all_transformations(df: pd.DataFrame,
 
         cols_before = result.shape[1]
 
-        result = check_replicates(result, groups, cell_line=cell_line, time_point_to_check="starve",
-                                  reference_condition="_EGF_")
+        result = check_replicates(result, groups, cell_line=cell_line, time_point_to_check="starve", reference_condition="_EGF_")
         result = compute_raw_stats(result, groups, cell_line=cell_line)
         result, log2_groups = compute_log2_abs(result, groups, cell_line=cell_line)
         result = compute_log2_stats(result, log2_groups, cell_line=cell_line)
@@ -733,10 +732,10 @@ def get_column_infos(protein_id: str,
         return float("nan")
 
     infos = []
-    for info in infos:
-        info = phospho_lookup.get((protein_id, info), None)
-        if info is not None:
-            infos.append(str(info))
+    for site in sites:
+        value = phospho_lookup.get((protein_id, site), None)
+        if value is not None and not (isinstance(value, float) and pd.isna(value)):
+            infos.append(str(value))
 
     return float("nan") if not infos else "|".join(infos)
 

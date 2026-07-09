@@ -26,7 +26,6 @@ CLI arguments:
   --ts_length         : time series length (default: 6)
   --ts_dimensions     : number of dimensions (default: 3)
   --exclude_full      : exclude full data (default: True)
-  --metric            : clustering distance metric (default: euclidean)
   --n_seeds           : number of seeds for stability (default: 10)
   --n_init            : KMeans initialisations per run (default: 5)
   --max_iterations    : max KMeans iterations (default: 100)
@@ -51,12 +50,28 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, silhouette_score
 from tslearn.metrics import cdist_dtw
 
-from utils import (
-    filter_replicates,
-    filter_site_localizations,
-    filter_dynamics_extremes,
-    tslearn_clustering_KMeans,
-)
+from src.filters import filter_by_nreps, filter_dynamics
+from src.clustering import tslearn_clustering_KShape
+
+
+def _filter_ascore(df: pd.DataFrame,
+                   min_ascore: float = 13.0,) -> pd.DataFrame:
+    """
+    Filter rows by minimum AScore (phosphosite localization confidence).
+
+    Replaces the old filter_site_localizations(df, loc_sites=True) from utils.
+    If the AScore column is absent (already filtered upstream), returns df unchanged.
+
+    Args:
+        df: DataFrame with optional AScore column.
+        min_ascore: minimum AScore threshold (default 13.0, corresponding to p < 0.05).
+
+    Returns:
+        Filtered DataFrame copy.
+    """
+    if "AScore" in df.columns:
+        return df.loc[df["AScore"] >= min_ascore].copy()
+    return df.copy()
 
 # ---------------------------------------------------------------------------
 # Worker-process globals (set once per worker by worker_init, Stage 1 only)
@@ -70,9 +85,9 @@ GLOBAL_TS_LENGTH     = None
 GLOBAL_TS_DIMENSIONS = None
 GLOBAL_EXCLUDE_FULL  = None
 GLOBAL_N_SEEDS       = None
-GLOBAL_METRIC        = None
 GLOBAL_N_INIT        = None
 GLOBAL_MAX_ITER      = None
+GLOBAL_CELL_LINES    = None
 
 
 def worker_init(
@@ -84,10 +99,10 @@ def worker_init(
     ts_length: int,
     ts_dimensions: int,
     exclude_full: bool,
-    metric: str,
     n_seeds: int,
     n_init: int,
     max_iterations: int,
+    cell_lines: list,
 ) -> None:
     """
     Run once per worker process (CPU/core) before any tasks are dispatched.
@@ -105,8 +120,8 @@ def worker_init(
 
     global GLOBAL_DF, GLOBAL_DATA_TYPE, GLOBAL_K_START, GLOBAL_K_END
     global GLOBAL_CONDITIONS, GLOBAL_TS_LENGTH, GLOBAL_TS_DIMENSIONS
-    global GLOBAL_EXCLUDE_FULL, GLOBAL_METRIC, GLOBAL_N_SEEDS
-    global GLOBAL_N_INIT, GLOBAL_MAX_ITER
+    global GLOBAL_EXCLUDE_FULL, GLOBAL_N_SEEDS
+    global GLOBAL_N_INIT, GLOBAL_MAX_ITER, GLOBAL_CELL_LINES
 
     GLOBAL_DF            = pd.read_pickle(filtered_pickle_path)
     GLOBAL_DATA_TYPE     = data_type
@@ -116,10 +131,10 @@ def worker_init(
     GLOBAL_TS_LENGTH     = ts_length
     GLOBAL_TS_DIMENSIONS = ts_dimensions
     GLOBAL_EXCLUDE_FULL  = exclude_full
-    GLOBAL_METRIC        = metric
     GLOBAL_N_SEEDS       = n_seeds
     GLOBAL_N_INIT        = n_init
     GLOBAL_MAX_ITER      = max_iterations
+    GLOBAL_CELL_LINES    = cell_lines
 
 
 # ---------------------------------------------------------------------------
@@ -147,30 +162,27 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
     cluster_name = (
         f"KMeans_{k}_cluster_seed{seed}_on_{GLOBAL_DATA_TYPE}"
         f"_excludeFull{GLOBAL_EXCLUDE_FULL}_nrep>1_locSite=True"
-        f"_log2FC>0.5_conditions({conditions_str})_metric{GLOBAL_METRIC}"
+        f"_log2FC>0.5_conditions({conditions_str})"
     )
     print(f"[clustering pid={os.getpid()}] k={k} seed={seed}", flush=True)
 
     # GLOBAL_DF is already copy-on-write isolated in this process; no .copy() needed.
-    df_clustered, model, multivariate = tslearn_clustering_KMeans(
+    KShape_all_univariate, model, multivariate = tslearn_clustering_KShape(
         df_to_cluster=GLOBAL_DF,
         data_type=GLOBAL_DATA_TYPE,
         condition_for_clustering=GLOBAL_CONDITIONS,
+        cell_lines=GLOBAL_CELL_LINES,
         exclude_full=GLOBAL_EXCLUDE_FULL,
-        cluster_column_name=cluster_name,
         number_of_clusters=k,
-        max_iterations=GLOBAL_MAX_ITER,
+        cluster_column_name=cluster_name,
         n_init=GLOBAL_N_INIT,
-        metric=GLOBAL_METRIC,
+        max_iterations=GLOBAL_MAX_ITER,
         df_dimensions=GLOBAL_TS_DIMENSIONS,
         time_series_length=GLOBAL_TS_LENGTH,
         random_state=seed,
         transpose=True,
         verbose=False,
-        testing=True,
-        barycenter_calculations=False,
-    )
-    # print(f"[worker] conditions={GLOBAL_CONDITIONS} | multivariate shape={multivariate.shape}", flush=True)
+        testing=True)
 
     return {
         "k": k,
@@ -228,7 +240,6 @@ def metrics_worker(k_results_dir_tuple: tuple) -> dict:
     if seed0:
         inertia_for_k      = seed0[0]["inertia"]
         multivariate_seed0 = seed0[0]["multivariate"]
-        # print(f"k={k} multivariate_seed0 shape: {multivariate_seed0.shape}", flush=True)
     else:
         print(f"WARNING: seed 0 result missing for k={k}; inertia=NaN", flush=True)
         inertia_for_k      = np.nan
@@ -274,8 +285,8 @@ def main() -> None:
 
     parser.add_argument("--input_file_path",  help="Path to input TSV file")
     parser.add_argument("--output_file_path", help="Prefix for all output files")
-    parser.add_argument("--data_type",        type=str,   default="log2_FC",
-                        help="Type of data used for clustering (default: log2_FC)")
+    parser.add_argument("--data_type",        type=str,   default="log2:FC",
+                        help="Type of data used for clustering (default: log2:FC)")
     parser.add_argument("--k_start",          type=int,   default=2,
                         help="Minimum number of clusters to test (default: 2)")
     parser.add_argument("--k_end",            type=int,   default=100,
@@ -289,8 +300,8 @@ def main() -> None:
                         help="Number of time series dimensions (default: 3)")
     parser.add_argument("--exclude_full",     type=bool,  default=True,
                         help="Exclude full data (default: True)")
-    parser.add_argument("--metric",           type=str,   default="euclidean",
-                        help="Distance metric for clustering (default: euclidean)")
+    # parser.add_argument("--metric",           type=str,   default="euclidean",
+    #                     help="Distance metric for clustering (default: euclidean)")
     parser.add_argument("--n_seeds",          type=int,   default=10,
                         help="Number of seeds for stability calculation (default: 10)")
     parser.add_argument("--n_init",           type=int,   default=5,
@@ -312,6 +323,10 @@ def main() -> None:
     parser.add_argument("--sil_patience",     type=int,   default=5,
                         help="Consecutive k-values below --sil_min before silhouette is skipped "
                              "(default: 5). Only used if --sil_min is set.")
+    parser.add_argument("--cell_lines",       nargs="+",  default=["WT"],
+                        help="Cell-line prefixes used to select data columns (default: WT). "
+                             "Must match the prefix in the column naming convention, "
+                             "e.g. WT BRAFS151A GAB1Y259A.")
 
     args = parser.parse_args()
 
@@ -327,19 +342,22 @@ def main() -> None:
         f"Run config:\n"
         f"  data_type={args.data_type} | k={args.k_start}–{args.k_end}\n"
         f"  conditions={args.conditions} | ts_length={args.ts_length} | ts_dimensions={args.ts_dimensions}\n"
-        f"  exclude_full={args.exclude_full} | metric={args.metric}\n"
+        f"  exclude_full={args.exclude_full} \n"
         f"  n_seeds={args.n_seeds} | n_init={args.n_init} | max_iterations={args.max_iterations}\n"
         f"  workers={args.workers} | metrics_workers={metrics_workers}\n"
         f"  sil_min={args.sil_min} | sil_patience={args.sil_patience}\n"
     )
     print(f"Raw DataFrame shape: {df_raw.shape}")
 
-    nreps_df           = filter_replicates(df_raw, n_reps=2)
-    localized_sites_df = filter_site_localizations(nreps_df, loc_sites=True)
-    df_filtered        = filter_dynamics_extremes(
+    nreps_df           = filter_by_nreps(df_raw, min_reps=2)
+    localized_sites_df = _filter_ascore(nreps_df)
+    df_filtered        = filter_dynamics(
         df=localized_sites_df,
+        cell_lines=args.cell_lines,
+        conditions=args.conditions,
         data_type=args.data_type,
         threshold=0.5,
+        mode="extremes",
         exclude_full=args.exclude_full,
     )
 
@@ -408,10 +426,10 @@ def main() -> None:
                 args.ts_length,
                 args.ts_dimensions,
                 args.exclude_full,
-                args.metric,
                 args.n_seeds,
                 args.n_init,
                 args.max_iterations,
+                args.cell_lines,
             ),
         ) as executor:
             futures = {executor.submit(cluster_worker, t): t for t in all_tasks}
@@ -540,7 +558,7 @@ def main() -> None:
     k_list = list(ks)
 
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(f"Kmeans Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
+    fig.suptitle(f"KShape Cluster QC Metrics | {conditions_label}", fontsize=14, fontweight="bold")
 
     for metric_name, values, ylabel, subplot in [
         ("inertia",    inertias,    "Inertia",                       0),

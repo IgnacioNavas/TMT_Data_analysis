@@ -53,13 +53,29 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, silhouette_score
 from tslearn.metrics import cdist_gak, sigma_gak  #cdist_dtw
 
-from utils import (
-    filter_replicates,
-    filter_site_localizations,
-    filter_dynamics_extremes,
-    # tslearn_clustering_KMeans,
-    kernnel_clustering,
-)
+from src.filters import filter_by_nreps, filter_dynamics
+from src.clustering import kernnel_clustering, reshape_df
+from src.column_spec import ColumnSpec
+
+
+def _filter_ascore(df: pd.DataFrame,
+                   min_ascore: float = 13.0,) -> pd.DataFrame:
+    """
+    Filter rows by minimum AScore (phosphosite localization confidence).
+
+    Replaces the old filter_site_localizations(df, loc_sites=True) from utils.
+    If the AScore column is absent (already filtered upstream), returns df unchanged.
+
+    Args:
+        df: DataFrame with optional AScore column.
+        min_ascore: minimum AScore threshold (default 13.0, corresponding to p < 0.05).
+
+    Returns:
+        Filtered DataFrame copy.
+    """
+    if "AScore" in df.columns:
+        return df.loc[df["AScore"] >= min_ascore].copy()
+    return df.copy()
 
 # ---------------------------------------------------------------------------
 # Worker-process globals (set once per worker by worker_init, Stage 1 only)
@@ -77,6 +93,8 @@ GLOBAL_METRIC        = None
 GLOBAL_N_INIT        = None
 # GLOBAL_MAX_ITER      = None
 GLOBAL_KERNEL_METRIC = None
+GLOBAL_GAK_SIGMA     = None
+GLOBAL_CELL_LINES    = None
 
 
 def worker_init(
@@ -93,6 +111,8 @@ def worker_init(
     n_init: int,
     # max_iterations: int,
     kernel_metric: str,
+    gak_sigma: float,
+    cell_lines: list,
 ) -> None:
     """
     Run once per worker process (CPU/core) before any tasks are dispatched.
@@ -111,7 +131,7 @@ def worker_init(
     global GLOBAL_DF, GLOBAL_DATA_TYPE, GLOBAL_K_START, GLOBAL_K_END
     global GLOBAL_CONDITIONS, GLOBAL_TS_LENGTH, GLOBAL_TS_DIMENSIONS
     global GLOBAL_EXCLUDE_FULL, GLOBAL_METRIC, GLOBAL_N_SEEDS
-    global GLOBAL_N_INIT, GLOBAL_KERNEL_METRIC #, GLOBAL_MAX_ITER
+    global GLOBAL_N_INIT, GLOBAL_KERNEL_METRIC, GLOBAL_GAK_SIGMA, GLOBAL_CELL_LINES #, GLOBAL_MAX_ITER
 
     GLOBAL_DF            = pd.read_pickle(filtered_pickle_path)
     GLOBAL_DATA_TYPE     = data_type
@@ -126,6 +146,8 @@ def worker_init(
     GLOBAL_N_INIT        = n_init
     # GLOBAL_MAX_ITER      = max_iterations
     GLOBAL_KERNEL_METRIC = kernel_metric
+    GLOBAL_GAK_SIGMA     = gak_sigma
+    GLOBAL_CELL_LINES    = cell_lines
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +184,7 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
         df_to_cluster=GLOBAL_DF.copy(),  # .copy() to avoid the dataframe to keep growing
         transpose=True,
         data_type=GLOBAL_DATA_TYPE,
+        cell_lines=GLOBAL_CELL_LINES,
         exclude_full=GLOBAL_EXCLUDE_FULL,
         condition_for_clustering=GLOBAL_CONDITIONS,
         df_dimensions=GLOBAL_TS_DIMENSIONS,
@@ -176,6 +199,8 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
         testing=True
     )
 
+    sigma = GLOBAL_GAK_SIGMA if GLOBAL_GAK_SIGMA is not None else sigma_gak(multivariate)
+
     return {
         "k": k,
         "seed": seed,
@@ -184,7 +209,8 @@ def cluster_worker(k_seed_tuple: tuple) -> dict:
         # Only ship multivariate back for seed 0 — needed once per k for silhouette.
         "multivariate": multivariate if seed == 0 else None,
         # "gak_sigma": model.kernel_params_.get("sigma", None) if seed == 0 else None,
-        "gak_sigma": sigma_gak(multivariate) if seed == 0 else None,
+        # "gak_sigma": sigma_gak(multivariate) if seed == 0 else None,
+        "gak_sigma": sigma if seed == 0 else None,
     }
 
 
@@ -324,8 +350,8 @@ def main() -> None:
 
     parser.add_argument("--input_file_path",  help="Path to input TSV file")
     parser.add_argument("--output_file_path", help="Prefix for all output files")
-    parser.add_argument("--data_type",        type=str,   default="log2_FC",
-                        help="Type of data used for clustering (default: log2_FC)")
+    parser.add_argument("--data_type",        type=str,   default="log2:FC",
+                        help="Type of data used for clustering (default: log2:FC)")
     parser.add_argument("--k_start",          type=int,   default=2,
                         help="Minimum number of clusters to test (default: 2)")
     parser.add_argument("--k_end",            type=int,   default=100,
@@ -349,6 +375,9 @@ def main() -> None:
     # parser.add_argument("--max_iterations",   type=int,   default=100,
     #                     help="Max KMeans iterations per run (default: 100). "
     #                          "Use 300 for final clustering runs, 100 is enough for QC sweeps.")
+    parser.add_argument("--gak_sigma", type=float, default=None,
+                        help="GAK sigma value. If None, estimated automatically from data. "
+                             "For normalized data consider setting this manually.")
     parser.add_argument("--workers",          type=int,   default=6,
                         help="Worker processes for Stage 1 clustering (default: 6)")
     parser.add_argument("--metrics_workers",  type=int,   default=None,
@@ -364,6 +393,10 @@ def main() -> None:
                              "(default: 5). Only used if --sil_min is set.")
     parser.add_argument("--kernel_metric", type=str, default="gak",
                         help = "Kernel metric for clustering (default: gak)")
+    parser.add_argument("--cell_lines",       nargs="+",  default=["WT"],
+                        help="Cell-line prefixes used to select data columns (default: WT). "
+                             "Must match the prefix in the column naming convention, "
+                             "e.g. WT BRAFS151A GAB1Y259A.")
 
     args = parser.parse_args()
 
@@ -386,12 +419,15 @@ def main() -> None:
     )
     print(f"Raw DataFrame shape: {df_raw.shape}")
 
-    nreps_df           = filter_replicates(df_raw, n_reps=2)
-    localized_sites_df = filter_site_localizations(nreps_df, loc_sites=True)
-    df_filtered        = filter_dynamics_extremes(
+    nreps_df           = filter_by_nreps(df_raw, min_reps=2)
+    localized_sites_df = _filter_ascore(nreps_df)
+    df_filtered        = filter_dynamics(
         df=localized_sites_df,
+        cell_lines=args.cell_lines,
+        conditions=args.conditions,
         data_type=args.data_type,
         threshold=0.5,
+        mode="extremes",
         exclude_full=args.exclude_full,
     )
 
@@ -400,6 +436,37 @@ def main() -> None:
         f"localized_sites_df: {localized_sites_df.shape}\n"
         f"df_filtered:        {df_filtered.shape}\n"
     )
+
+    # Add this block after df_filtered is created and before tmpdir is created:
+    from tslearn.metrics import sigma_gak as _sigma_gak
+    if args.gak_sigma is not None:
+        gak_sigma = args.gak_sigma
+        print(f"GAK sigma: using manually set value: {gak_sigma}\n")
+    else:
+        # Estimate sigma from a small random sample of the data to save time
+        # Full estimation on 6000 samples is expensive; 500 is enough for a good estimate
+        sample_size = min(500, len(df_filtered))
+        df_sample = df_filtered.sample(n=sample_size, random_state=0)
+        column_selection = ColumnSpec.select(
+            df_sample,
+            cell_lines=args.cell_lines,
+            data_type=args.data_type,
+            conditions=args.conditions,
+            exclude_full=True,
+            exclude_replicate_cols=True,
+        )
+        multivariate_sample, _ = reshape_df(
+            df=df_sample,
+            time_series=column_selection,
+            labels="site",
+            dimensions=args.ts_dimensions,
+            len_time_serie=args.ts_length,
+            transpose=True,
+            verbose=False,
+        )
+        gak_sigma = float(_sigma_gak(multivariate_sample))
+        print(f"GAK sigma: estimated automatically from {sample_size} samples: {gak_sigma}\n")
+
 
     # Temp directory for pickle files (filtered df + per-result files)
     tmpdir = tempfile.mkdtemp(prefix="cluster_par_")
@@ -465,6 +532,8 @@ def main() -> None:
                 args.n_init,
                 # args.max_iterations,
                 args.kernel_metric,
+                gak_sigma,
+                args.cell_lines,
             ),
         ) as executor:
             futures = {executor.submit(cluster_worker, t): t for t in all_tasks}

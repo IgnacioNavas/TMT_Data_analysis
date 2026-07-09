@@ -157,25 +157,23 @@ def add_modification_metadata(
     # Build absolute-position modification strings; NaN for rows without any modification
     clean_mods = mods.apply(_clean_mod_string)
     abs_mods = [_offset_mod_positions(mod, start) if mod else np.nan for mod, start in zip(clean_mods, result[site_start_col])]
-    result["assigned_modifications_clean"] = abs_mods
+    result["assigned_modifications_clean"] = abs_mods  #
     result.loc[mods.isna(), "assigned_modifications_clean"] = np.nan
 
     # Extract only STY positions (filters out oxidation, N-term acetylation, etc.)
     result["sty_positions"] = result["assigned_modifications_clean"].apply(_extract_sty_positions)
 
-    # Composite site identifier built from STY-only positions; NaN when no STY modification present
-    has_sty = result["sty_positions"].notna()
-    result["site_index"] = np.where( #site instead of site_index
-        has_sty,
-        (result[protein_id_col].astype(str) + "_"
-         + result[site_start_col].astype(str) + "_"
-         + result[site_end_col].astype(str) + "_"
-         + result["n_localized"].astype(str) + "_"
-         + result["STY_localized"].astype(str) + "_"
-         + result["sty_positions"].astype(str)),
-        np.nan,
+    # Composite site identifier; when no STY modification is present, sty_positions is "0"
+    sty_label = result["sty_positions"].fillna("0")
+    result["site_index"] = (
+        result[protein_id_col].astype(str) + "_"
+        + result[site_start_col].astype(str) + "_"
+        + result[site_end_col].astype(str) + "_"
+        + result["n_localized"].astype(str) + "_"
+        + result["STY_localized"].astype(str) + "_"
+        + sty_label.astype(str)
     )
-    result["site"] = result["site_index"].astype(str) + "~" + result["modified_sequence"].str.replace(r'([A-Z])(\[\d+\.?\d*\])', lambda m: m.group(1).lower(), regex=True)
+    result["site"] = result["site_index"].astype(str) + "~" + result["Modified_Sequence"].str.replace(r'([A-Z])(\[\d+\.?\d*\])', lambda m: m.group(1).lower(), regex=True)
     return result
 
 

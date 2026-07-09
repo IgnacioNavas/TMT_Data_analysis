@@ -8,7 +8,7 @@
 #./notebooks
 ./PhosX
 #./scripts
-./Server_results
+Server/Server_results
 #./src
 ./Old
 
@@ -18,7 +18,7 @@
 
 claudeignore
 CLAUDE.md
-claude_history.txt
+Claude_promts/claude_history.txt
 environment_202602.yml
-Global_report.md
-top_kinase_histogram.png
+Experiment/General_result/Global_report.md
+Old/top_kinase_histogram.png
