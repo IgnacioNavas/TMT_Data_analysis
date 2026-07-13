@@ -1287,11 +1287,11 @@ def plot_sweep_heatmaps(results_df,
 
 
 # =============================================================================
-# TODO — post-hoc enrichment (NOT part of clustering; runs AFTER, on metadata)
+# Next step — post-hoc enrichment (NOT part of clustering; runs AFTER, on metadata)
 # =============================================================================
 def posthoc_enrichment_fisher(*args, **kwargs):
     """
-    PLACEHOLDER / TODO — post-hoc enrichment of cluster membership vs. site metadata.
+    PLACEHOLDER / Next step — post-hoc enrichment of cluster membership vs. site metadata.
 
     Intentionally NOT implemented yet. Clustering and threshold selection are kept
     strictly time-series-shape only; site metadata (e.g. ERK vs. non-ERK motif,
@@ -1307,7 +1307,7 @@ def posthoc_enrichment_fisher(*args, **kwargs):
         statsmodels.stats.multitest.multipletests),
       * return a tidy DataFrame (cluster, odds_ratio, p_value, q_value, counts).
 
-    See the "post-hoc enrichment" TODO cell in the sweep notebook.
+    See the "post-hoc enrichment" next step cell in the sweep notebook.
     """
     raise NotImplementedError(
         "posthoc_enrichment_fisher is a placeholder; implement once site metadata "
