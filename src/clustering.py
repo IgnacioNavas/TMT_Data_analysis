@@ -1,3 +1,6 @@
+from typing import Any
+
+from numpy import ndarray, dtype
 
 from src.column_spec import ColumnSpec
 
@@ -15,7 +18,7 @@ from tslearn.metrics import cdist_dtw
 import tslearn as tsl
 
 from scipy.cluster.hierarchy import linkage
-from scipy.spatial.distance import squareform
+from scipy.spatial.distance import squareform, pdist
 
 #---------------------
 # Helper fucntions
@@ -25,12 +28,20 @@ def reshape_df(df,
                dimensions,
                len_time_serie,
                stoichiometry=None,
-               verbose = None,
                labels="site",
                transpose=False,
+               verbose=None,
                ):
     '''
     Reshape dataframe so it is multivariate format. Return the dataframe in numpy format so can be used, and list with the names of myseries
+    Args:
+        df: dataframe
+        time_series: list with the column names for the time series to be selected
+        dimensions: list with the dimensions of the time series to be selected (if conditions EGF and INS  are used then these will be 2 dimensions)
+        len_time_serie: length of the time series. Used for transposing the matrix if needed
+        stoichiometry: dictionary with the stoichiometry of the time series to be used. this can be used to modify weights of the conditons or cell lines when clustering
+        labels: column name for the labels of the time series
+        transpose: false or true. For some algorithms changes the perception the clustering method sees the time series data. Needs to be true to change stoichometry
     '''
     sub_df = df[time_series].copy()
     mySeries = sub_df.to_numpy()
@@ -83,31 +94,52 @@ def reshape_df(df,
         if verbose:
             print(f"Shape after stoichiometry reweighting: {multivariate_df.shape}")
 
-
     return multivariate_df, namesofMySeries
 
 #----------------------
 # Clustering
 #----------------------
-def tslearn_clustering_KMeans(df_to_cluster,
-                              data_type,
-                              condition_for_clustering=None,
-                              cell_lines=None,
-                              exclude_full=False,
-                              stoichiometry=None,
-                              cluster_column_name="",
-                              number_of_clusters=10,
-                              max_iterations=1000,
-                              n_init=5,
-                              metric='euclidean',
-                              df_dimensions=None,
-                              random_state=0,
-                              time_series_length=None,
-                              transpose=False,
-                              verbose=True,
-                              testing=False,
-                              barycenter_calculations=False,
+def tslearn_clustering_KMeans(df_to_cluster: object,
+                              data_type: object,
+                              condition_for_clustering: object = None,
+                              cell_lines: object = None,
+                              exclude_full: object = False,
+                              df_dimensions: object = None,
+                              time_series_length: object = None,
+                              stoichiometry: object = None,
+                              cluster_column_name: object = "",
+                              number_of_clusters: object = 10,
+                              max_iterations: object = 1000,
+                              n_init: object = 5,
+                              metric: object = 'euclidean',
+                              random_state: object = 0,
+                              transpose: object = False,
+                              testing: object = False,
+                              barycenter_calculations: object = False,
+                              verbose: object = True,
                               ):
+    """
+    Does unsupervised clustering of a time series dataset using KMeans algorithm from tslearn.
+
+    Args:
+        df_to_cluster (object): dataframe to cluster
+        data_type: type of data used to cluster - log2:FC, raw:mean ( it hase to be data not dependent on replicates)
+        condition_for_clustering: experimental condition of the data to use for the clustering
+        cell_lines: list of cell lines to cluster
+        exclude_full: whether to exclude full cell lines from clustering
+        stoichiometry: by default it is 1. I alows to change weight of cell lines or conditions in the clustering
+        cluster_column_name: name the column holding the cluster labels in the results will take
+        number_of_clusters: number of clusters to generate
+        max_iterations: maximum number of iterations
+        n_init: number of iterations to run
+        metric: metric used to calculate distances between time series. Use suclidean since our time series are already aligned
+        random_state : random seed for reproducibility
+        df_dimensions: list with the dimensions of the time series to be selected (if conditions EGF and INS  are used then these will be 2 dimensions)
+        time_series_length: length of the time series to use
+        transpose: false or true. For some algorithms changes the perception the clustering method sees the time series data. Needs to be true to change stoichometry
+        testing: option that allows to return more parameters of the clusters
+        barycenter_calculations:
+    """
 
     if condition_for_clustering is None:
         condition_for_clustering = []
@@ -166,18 +198,40 @@ def tslearn_clustering_KShape(df_to_cluster,
                               data_type,
                               condition_for_clustering=None,
                               cell_lines=None,
-                              stoichiometry=None,
                               exclude_full=False,
-                              number_of_clusters=10,
-                              cluster_column_name="",
-                              n_init=5,
-                              max_iterations=1000,
                               df_dimensions=None,
                               time_series_length=None,
+                              stoichiometry=None,
+                              cluster_column_name="",
+                              number_of_clusters=10,
+                              n_init=5,
+                              max_iterations=1000,
                               random_state=0,
                               transpose=False,
+                              testing=False,
                               verbose=True,
-                              testing=False):
+                              ):
+    """
+    Does unsupervised clustering of a time series dataset using KShape algorithm from tslearn. Doesn't have amplitude into account
+
+    Args:
+        df_to_cluster (object): dataframe to cluster
+        data_type: type of data used to cluster - log2:FC, raw:mean ( it hase to be data not dependent on replicates)
+        condition_for_clustering: experimental condition of the data to use for the clustering
+        cell_lines: list of cell lines to cluster
+        exclude_full: whether to exclude full cell lines from clustering
+        stoichiometry: by default it is 1. I alows to change weight of cell lines or conditions in the clustering
+        cluster_column_name: name the column holding the cluster labels in the results will take
+        number_of_clusters: number of clusters to generate
+        max_iterations: maximum number of iterations
+        n_init: number of iterations to run
+        metric: metric used to calculate distances between time series. Use suclidean since our time series are already aligned
+        random_state : random seed for reproducibility
+        df_dimensions: list with the dimensions of the time series to be selected (if conditions EGF and INS  are used then these will be 2 dimensions)
+        time_series_length: length of the time series to use
+        transpose: false or true. For some algorithms changes the perception the clustering method sees the time series data. Needs to be true to change stoichometry
+        testing: option that allows to return more parameters of the clusters
+    """
 
     if condition_for_clustering is None:
         condition_for_clustering = []
@@ -219,22 +273,44 @@ def tslearn_clustering_KShape(df_to_cluster,
 
 
 def kernnel_clustering(df_to_cluster,
-                       transpose=True,
                        data_type="log2:FC",
-                       cell_lines=None,
-                       stoichiometry=None,
-                       exclude_full=True,
                        condition_for_clustering=None,
+                       cell_lines=None,
+                       exclude_full=True,
+                       stoichiometry=None,
+                       transpose=True,
                        df_dimensions=None,
                        time_series_length=None,
-                       seed=0,
+                       cluster_column_name="",
                        n_clusters=25,
+                       seed=0,
                        n_init=20,
-                       verbose=True,
                        kernel="gak",
                        kernel_params=None,
-                       cluster_column_name="",
-                       testing=False):
+                       testing=False,
+                       verbose=True,
+                       ):
+    """
+    Does unsupervised clustering of a time series dataset using Kernel algorithm from tslearn.
+
+    Args:
+        df_to_cluster (object): dataframe to cluster
+        data_type: type of data used to cluster - log2:FC, raw:mean ( it hase to be data not dependent on replicates)
+        condition_for_clustering: experimental condition of the data to use for the clustering
+        cell_lines: list of cell lines to cluster
+        exclude_full: whether to exclude full cell lines from clustering
+        stoichiometry: by default it is 1. I alows to change weight of cell lines or conditions in the clustering
+        cluster_column_name: name the column holding the cluster labels in the results will take
+        number_of_clusters: number of clusters to generate
+        max_iterations: maximum number of iterations
+        n_init: number of iterations to run
+        metric: metric used to calculate distances between time series. Use suclidean since our time series are already aligned
+        random_state : random seed for reproducibility
+        df_dimensions: list with the dimensions of the time series to be selected (if conditions EGF and INS  are used then these will be 2 dimensions)
+        time_series_length: length of the time series to use
+        transpose: false or true. For some algorithms changes the perception the clustering method sees the time series data. Needs to be true to change stoichometry
+        testing: option that allows to return more parameters of the clusters
+    """
 
     if condition_for_clustering is None:
         condition_for_clustering = []
@@ -424,7 +500,7 @@ def _resolve_clustering_columns(df,
     return cols, n_timepoints, n_dims
 
 
-def cluster_similarity_cdist_dtw(
+def cluster_similarity_cdist_dtw( # Time series are aligned, could use euclidean distances: lighter computation
     df,
     cell_lines,
     conditions,
@@ -480,7 +556,10 @@ def cluster_similarity_cdist_dtw(
     return cluster_metric
 
 
-def _mean_dtw_per_condition(X_time_cond, conditions):
+def _mean_dtw_per_condition( # Time series are aligned, could use euclidean distances: lighter computation
+        X_time_cond,
+        conditions
+        ):
     """
     Compute mean DTW distance per condition for a single cluster.
 
@@ -499,6 +578,42 @@ def _mean_dtw_per_condition(X_time_cond, conditions):
     return out
 
 
+def _mean_distance_per_condition( # Time series are aligned, could use euclidean distances: lighter computation
+        X_time_cond,
+        conditions,
+        metric="euclidean",
+        ):
+    """
+    Compute the mean pairwise distance between sites, per condition, for one cluster.
+
+    Generalises _mean_dtw_per_condition() to support either DTW (time-warping,
+    sensitive to profile shape with misaligned timing) or plain Euclidean distance
+    (point-by-point; appropriate when all sites share the same fixed timepoints,
+    which is the case in this project). Euclidean is also far cheaper to compute.
+
+    Args:
+        X_time_cond: array of shape (n_sites, n_timepoints, n_conditions) with transpose=True.
+        conditions: list of condition labels matching the last axis of X_time_cond.
+        metric: "dtw" (default) or "euclidean".
+
+    Returns:
+        dict mapping condition label → mean pairwise distance (NaN if <2 sites).
+    """
+    out = {}
+    for i, cond in enumerate(conditions):
+        Xc = X_time_cond[:, :, i]  # (n_sites, n_timepoints)
+        if metric == "dtw":
+            D = cdist_dtw(Xc[:, :, None])
+            tri = D[np.triu_indices_from(D, k=1)]
+        elif metric == "euclidean":
+            # pdist returns the condensed upper-triangle of pairwise distances directly
+            tri = pdist(Xc, metric="euclidean")
+        else:
+            raise ValueError(f"metric must be 'dtw' or 'euclidean', got {metric!r}")
+        out[cond] = float(np.mean(tri)) if len(tri) else float("nan")
+    return out
+
+
 def cluster_similarity_per_condition(df,
                                      cell_lines,
                                      conditions,
@@ -506,9 +621,13 @@ def cluster_similarity_per_condition(df,
                                      cluster_column_name="",
                                      exclude_full=True,
                                      transpose=True,
+                                     metric="euclidean",
                                      verbose=False,):
     """
-    Mean DTW distance per condition for each cluster.
+    Mean within-cluster pairwise distance per condition for each cluster.
+
+    Lower values mean a cluster's sites follow more similar temporal profiles for
+    that condition. Use `metric` to choose how distance is measured.
 
     Args:
         df: DataFrame following the project naming convention, with a cluster column.
@@ -518,10 +637,13 @@ def cluster_similarity_per_condition(df,
         cluster_column_name: name of the column holding cluster labels.
         exclude_full: if True, exclude the 'full' timepoint (default True).
         transpose: if True (default), reshape to (n_samples, n_timepoints, n_conditions).
+        metric: "dtw" (default, time-warping) or "euclidean" (point-by-point;
+                appropriate here since all sites share the same fixed timepoints,
+                and much faster).
         verbose: if True, print reshape info.
 
     Returns:
-        dict mapping cluster label → {condition_label: mean_dtw_scalar}.
+        dict mapping cluster label → {condition_label: mean_distance_scalar}.
     """
     cols, n_timepoints, n_dims = _resolve_clustering_columns(
         df, cell_lines, conditions, data_type, exclude_full
@@ -539,7 +661,7 @@ def cluster_similarity_per_condition(df,
                           len_time_serie=n_timepoints,
                           transpose=transpose,
                           verbose=verbose,)
-        cluster_metric[cluster] = _mean_dtw_per_condition(X, cond_labels)
+        cluster_metric[cluster] = _mean_distance_per_condition(X, cond_labels, metric=metric)
 
     return cluster_metric
 
@@ -726,4 +848,204 @@ def get_site_centroid_distances(df_clustered,
     return distances, assigned_cluster, row_position
 
 
+# =============================================================================
+# Consensus / stability of a clustering
+# =============================================================================
+def consensus_stability(df,
+                        cluster_fn,
+                        n_runs=20,
+                        bootstrap=False,
+                        bootstrap_frac=0.8,
+                        replace=False,
+                        compute_coassociation=True,
+                        max_sites_for_coassociation=6000,
+                        reference_run=0,
+                        reference_labels=None,
+                        random_state=0,
+                        verbose=True,):
+    """
+    Measure how reproducible a clustering is, and score each site's reliability.
+
+    WHY THIS EXISTS
+    ---------------
+    Every clustering method here (KMeans, KShape, KernelKMeans, HDBSCAN, the
+    adaptive divisive+agglomerative method) is stochastic: change the random seed
+    (or perturb the input slightly) and some sites move between clusters. Before
+    those cluster labels are used as ground truth to train a classifier and
+    transfer it to the mutant datasets, we need to know WHICH assignments are
+    trustworthy and which are coin-flips. Inertia / silhouette tell you how tight
+    the clusters look in one run; they do NOT tell you whether you'd get the same
+    clusters again. Stability does — and it is the single most useful reliability
+    check for this project's workflow, because a label that flips between runs
+    will only inject noise into the downstream classifier.
+
+    WHAT IT DOES
+    ------------
+    Runs `cluster_fn` `n_runs` times with different random seeds (optionally on
+    bootstrap resamples of the sites), then quantifies agreement two ways:
+
+      * GLOBAL stability — the mean Adjusted Rand Index (ARI) between every pair
+        of runs. ARI is 1.0 for identical partitions and ~0 for random ones, and
+        is invariant to cluster-label permutation, so it is a clean "how
+        reproducible is the whole clustering" number. This never needs the
+        O(n^2) co-association matrix, so it always runs.
+
+      * PER-SITE stability — from the co-association (consensus) matrix: the
+        fraction of runs in which each pair of sites lands in the same cluster.
+        Each site's stability is the average co-association with the other
+        members of a reference cluster (Monti et al. "cluster consensus"). A site
+        near 1.0 reliably travels with the same neighbours; a site near 0 is on a
+        cluster boundary and its label should be treated with low confidence.
+        This is O(n^2) in memory, so it is only computed when the number of sites
+        is <= `max_sites_for_coassociation` (cluster on the *filtered* set).
+
+    HOW TO USE IT (method-agnostic)
+    -------------------------------
+    Pass a small wrapper that runs your chosen method for a given seed and
+    returns a 1-D label array aligned with the rows of `df`:
+
+        def cluster_fn(d, seed):
+            d2, model, X = tslearn_clustering_KMeans(
+                d.copy(), data_type="log2:FC", condition_for_clustering=["_EGF_"],
+                cell_lines=["WT"], number_of_clusters=15, df_dimensions=1,
+                time_series_length=6, cluster_column_name="_tmp",
+                random_state=seed, verbose=False, testing=True)
+            return d2["_tmp"].values
+
+        stab = consensus_stability(df_filtered, cluster_fn, n_runs=20)
+        print(stab["mean_ari"])                       # global reproducibility
+        df_filtered["stability"] = stab["per_site_stability"]
+
+    The exact same call works for any method (adaptive, kernel, KShape, ...): only
+    the wrapper changes. Compare methods by their `mean_ari` and per-site scores
+    on identical data — this is the "same footing" comparison.
+
+    Args:
+        df: DataFrame to cluster (already filtered). Sites are its rows.
+        cluster_fn: callable(sub_df, seed) -> 1-D array of integer labels with one
+            entry per row of `sub_df`. Must be deterministic given the seed.
+        n_runs: number of clustering repetitions (default 20).
+        bootstrap: if True, each run clusters a random subset of the sites
+            (assesses robustness to the sample, not just the seed). If False
+            (default), every run uses all sites and only the seed varies.
+        bootstrap_frac: fraction of sites sampled per run when bootstrap=True
+            (default 0.8).
+        replace: whether bootstrap sampling is with replacement (default False;
+            note that with replacement, duplicate rows are collapsed here so each
+            site appears at most once per run).
+        compute_coassociation: if True (default), compute the per-site stability
+            (needs the O(n^2) matrix; skipped with a message if n is too large).
+        max_sites_for_coassociation: skip the co-association matrix above this many
+            sites to avoid large memory use (default 6000 -> ~2 x 144 MB).
+        reference_run: index of the run whose partition defines each site's
+            "cluster" for the per-site score (default 0). Ignored if
+            `reference_labels` is given.
+        reference_labels: optional full-length array of labels (one per row of df)
+            to use as the reference partition instead of a run — useful in
+            bootstrap mode, where a single deterministic clustering covers all
+            sites while individual runs do not.
+        random_state: seed for the seed-generator and the bootstrap sampler
+            (default 0) so the whole stability analysis is itself reproducible.
+        verbose: if True, print progress and the headline numbers.
+
+    Returns:
+        dict with keys:
+            "mean_ari": float — mean pairwise ARI across runs (global stability).
+            "std_ari": float — standard deviation of the pairwise ARIs.
+            "ari_pairwise": np.ndarray — all pairwise ARI values.
+            "per_site_stability": pd.Series aligned to df.index, or None if the
+                co-association matrix was skipped. Values in [0, 1] (NaN for sites
+                absent from the reference partition).
+            "mean_site_stability": float or None — mean of per_site_stability.
+            "consensus_matrix": np.ndarray (n x n) of co-association fractions, or
+                None if skipped. Mostly for plotting / consensus reclustering.
+            "labels_per_run": np.ndarray (n_runs x n), with -1 marking sites absent
+                from a run (only possible under bootstrap).
+    """
+    from sklearn.metrics import adjusted_rand_score
+
+    rng = np.random.default_rng(random_state)
+    n = len(df)
+    idx_all = np.arange(n)
+
+    # -1 marks "this site was not part of this run" (only happens with bootstrap)
+    full_labels = np.full((n_runs, n), -1, dtype=int)
+
+    for r in range(n_runs):
+        seed = int(rng.integers(0, 2 ** 31 - 1))
+        if bootstrap:
+            m = int(round(bootstrap_frac * n))
+            sample_idx = np.unique(rng.choice(idx_all, size=m, replace=replace))
+            sub = df.iloc[sample_idx]
+            labs = np.asarray(cluster_fn(sub, seed))
+            full_labels[r, sample_idx] = labs
+        else:
+            labs = np.asarray(cluster_fn(df, seed))
+            full_labels[r, :] = labs
+        if verbose:
+            print(f"  run {r + 1}/{n_runs} done (seed={seed})")
+
+    # --- Global stability: mean pairwise ARI over the shared sites of each pair ---
+    ari_values = []
+    for i in range(n_runs):
+        for j in range(i + 1, n_runs):
+            mask = (full_labels[i] >= 0) & (full_labels[j] >= 0)
+            if mask.sum() >= 2:
+                ari_values.append(adjusted_rand_score(full_labels[i][mask],
+                                                      full_labels[j][mask]))
+    ari_values = np.asarray(ari_values, dtype=float)
+    mean_ari = float(np.mean(ari_values)) if len(ari_values) else float("nan")
+    std_ari = float(np.std(ari_values)) if len(ari_values) else float("nan")
+
+    # --- Per-site stability via the co-association (consensus) matrix ---
+    per_site = None
+    mean_site_stability = None
+    consensus_matrix = None
+
+    if compute_coassociation and n <= max_sites_for_coassociation:
+        co = np.zeros((n, n), dtype=np.int32)    # times pair co-clustered
+        pair = np.zeros((n, n), dtype=np.int32)  # times pair both present
+        for r in range(n_runs):
+            present = full_labels[r] >= 0
+            pmask = present[:, None] & present[None, :]
+            pair += pmask
+            same = (full_labels[r][:, None] == full_labels[r][None, :]) & pmask
+            co += same
+        with np.errstate(invalid="ignore", divide="ignore"):
+            consensus_matrix = np.where(pair > 0, co / pair, np.nan)
+
+        # Reference partition: an explicit labelling, else a chosen run.
+        if reference_labels is not None:
+            ref = np.asarray(reference_labels)
+        else:
+            ref = full_labels[reference_run]
+
+        per_site_arr = np.full(n, np.nan)
+        for i in range(n):
+            if ref[i] < 0:
+                continue
+            mates = np.where(ref == ref[i])[0]
+            mates = mates[mates != i]
+            if len(mates) == 0:
+                continue
+            per_site_arr[i] = np.nanmean(consensus_matrix[i, mates])
+        per_site = pd.Series(per_site_arr, index=df.index)
+        mean_site_stability = float(np.nanmean(per_site_arr))
+    elif compute_coassociation and verbose:
+        print(f"  Skipping co-association matrix: {n} sites > "
+              f"max_sites_for_coassociation={max_sites_for_coassociation}. "
+              f"Global ARI still computed.")
+
+    if verbose:
+        print(f"\nMean pairwise ARI: {mean_ari:.3f} +/- {std_ari:.3f}")
+        if mean_site_stability is not None:
+            print(f"Mean per-site stability: {mean_site_stability:.3f}")
+
+    return {"mean_ari": mean_ari,
+            "std_ari": std_ari,
+            "ari_pairwise": ari_values,
+            "per_site_stability": per_site,
+            "mean_site_stability": mean_site_stability,
+            "consensus_matrix": consensus_matrix,
+            "labels_per_run": full_labels,}
 

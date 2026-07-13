@@ -94,7 +94,8 @@ src/                        Python modules
   transformations.py        Data transformation pipeline (run_all_transformations)
   QC.py                     Quality control functions (sections 1–4, see notebooks/02_qc/)
   plotting_functions.py     Visualisation: time series, cluster, protein profile plots
-  clustering.py             Clustering utilities
+  clustering.py             Clustering utilities (tslearn KMeans/KShape/KernelKMeans, HDBSCAN, quality metrics)
+  adaptive_clustering.py    Adaptive divisive+agglomerative KMeans (inertia-driven split then centroid merge)
   lfq_pretreatment.py       LFQ-specific preprocessing (mutant datasets)
   utils.py                  Shared utilities
 
@@ -107,8 +108,9 @@ notebooks/
     General_QC.ipynb        Markdown reference — QC checklist organized by stage (not executable)
     MSMS_data_QC.ipynb      Executable QC: missing values, CV, PCA, UMAP, dataset overlap
   03_clustering/            Unsupervised clustering
-    Clustering.ipynb        WT k-scan and final clustering (TimeSeriesKMeans primary method)
-    clustering_overview.md  Reference document for all clustering strategies and parameters
+    Clustering.ipynb            WT k-scan and final clustering (TimeSeriesKMeans primary method)
+    Adaptive_clustering.ipynb   Divisive+agglomerative adaptive clustering (src/adaptive_clustering.py)
+    clustering_overview.md      Reference document for all clustering strategies and parameters
   04_visualization/         Time series and profile plots
   05_downstream/            Downstream analysis (pathway enrichment, classifier)
   scratch/                  Exploratory / throwaway notebooks

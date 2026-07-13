@@ -22,6 +22,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+import plotly.io as pio
 from matplotlib_venn import venn2, venn3
 from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
