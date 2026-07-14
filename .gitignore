@@ -5,7 +5,7 @@
 ./Claude_promts
 ./Experiment/*
 ./External_Data/*
-#./notebooks
+./notebooks/*/Results/*
 ./PhosX
 #./scripts
 Server/Server_results

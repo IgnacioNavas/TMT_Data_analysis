@@ -150,6 +150,7 @@ All data columns follow the pattern:
   - `median` — median across replicates
   - `FC` — fold change relative to the starve control (log2 scale only)
   - `scaled` — FC scaled so amplitude is in [−1, 1] and starve = 0
+  - `zscore` — per-site z-score of the FC temporal profile, standardised across the time series **per condition per cell line** (mean 0, std 1); isolates response shape from amplitude
   - `sd` — standard deviation across replicates
   - `cv` — coefficient of variation (%)
   - `var` — variance

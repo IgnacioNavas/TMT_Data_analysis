@@ -412,6 +412,74 @@ def compute_scaled_fc(df: pd.DataFrame,
     return result
 
 
+def compute_zscore_fc(df: pd.DataFrame,
+                      cell_line: str = "WT",
+                      conditions: list = ['_EGF_', '_INS_', '_EGFnINS_'],
+                      exclude_full: bool = False) -> pd.DataFrame:
+    """
+    Compute a per-site z-score of the temporal profile, separately per condition and cell line.
+
+    For each peptide (row) and each (cell_line, condition), the log2:FC values across
+    the timepoints of that condition are standardised:
+
+        log2:zscore(condition, timepoint) =
+            (log2:FC(timepoint) − mean_t log2:FC) / std_t log2:FC
+
+    where the mean and (population, ddof=0) standard deviation are taken across the
+    timepoints of that condition ONLY — so every condition of every cell line is
+    normalised independently. This removes amplitude differences between sites,
+    leaving only the SHAPE of the temporal response, which is useful for clustering
+    profiles by dynamics rather than magnitude.
+
+    Note: z-scoring is invariant to an additive shift, so standardising log2:FC gives
+    the same result as standardising log2:mean (log2:FC is log2:mean minus the
+    constant starve baseline). log2:FC is used here because it is already produced
+    by the pipeline.
+
+    Sites whose profile is flat within a condition (std = 0) yield NaN for that
+    condition. NaN timepoints are ignored when computing the mean/std (skipna).
+
+    Output column names:
+        {cell_line}_log2:zscore_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:FC columns (produced by compute_fold_change).
+        cell_line: cell line identifier prefix, e.g. 'WT'.
+        conditions: list of condition substrings to match, e.g. ['_EGF_', '_INS_'].
+        exclude_full: if True, drop the 'full' timepoint from the series before
+            computing the z-score (default False, matching compute_scaled_fc).
+
+    Returns:
+        Copy of df with the new log2:zscore columns appended.
+    """
+    result = df.copy()
+    zscore_cols = {}
+
+    # Standardise each condition independently (per condition per cell line).
+    for condition in conditions:
+        fc_cols = ColumnSpec.select(result, cell_lines=[cell_line], data_type="log2:FC",
+                                    conditions=[condition], exclude_full=exclude_full,)
+        if not fc_cols:
+            warnings.warn(
+                f"compute_zscore_fc: no log2:FC columns found for "
+                f"cell_line='{cell_line}', condition='{condition}'."
+            )
+            continue
+
+        sub = result[fc_cols]
+        row_mean = sub.mean(axis=1)
+        row_std = sub.std(axis=1, ddof=0).replace(0, np.nan)  # flat profiles -> NaN
+
+        zscore_names = _new_columns_group(fc_cols, match="FC", replace="zscore", replicates=False)
+        for fc_col, zscore_col in zip(fc_cols, zscore_names):
+            zscore_cols[zscore_col] = (result[fc_col] - row_mean) / row_std
+
+    for col_name, series in zscore_cols.items():
+        result[col_name] = series
+
+    return result
+
+
 def compute_pvalues(df: pd.DataFrame,
                     log2_groups: dict,
                     cell_line: str = "WT") -> pd.DataFrame:
@@ -575,9 +643,10 @@ def run_all_transformations(df: pd.DataFrame,
         4. log2:mean, log2:median, log2:sd
         5. log2:FC  (fold change vs. starve, per treatment)
         6. log2:scaled (max-normalized fold change)
-        7. log2:pvalue (Welch t-test vs. starve, per treatment × timepoint)
-        8. log2:FDR (Benjamini-Hochberg correction per treatment × timepoint)
-        9. log2:adjustedFDR
+        7. log2:zscore (per-site z-score of the temporal profile, per condition per cell line)
+        8. log2:pvalue (Welch t-test vs. starve, per treatment × timepoint)
+        9. log2:FDR (Benjamini-Hochberg correction per treatment × timepoint)
+        10. log2:adjustedFDR
 
     All cell lines share the same output DataFrame — their derived columns are
     simply appended side-by-side.  Cell lines that have no matching columns are
@@ -621,6 +690,7 @@ def run_all_transformations(df: pd.DataFrame,
         result = compute_log2_stats(result, log2_groups, cell_line=cell_line)
         result = compute_fold_change(result, log2_groups, cell_line=cell_line)
         result = compute_scaled_fc(result, cell_line=cell_line, conditions=conditions)
+        result = compute_zscore_fc(result, cell_line=cell_line, conditions=conditions)
         result = compute_pvalues(result, log2_groups, cell_line=cell_line)
         result = compute_fdr(result, cell_line=cell_line)
         result = compute_log10_fdr(result, cell_line=cell_line)

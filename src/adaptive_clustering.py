@@ -921,6 +921,25 @@ def diagnose_cluster_substructure(result,
          distance and plots the mean time series of each half next to the cluster
          centroid, per condition, so their shapes can be compared visually.
 
+    Interpreting bic_1 vs bic_2:
+      * bic_1 = BIC of a 1-Gaussian fit to the distances = "members form a single
+        shell around the centroid" (one shape).
+      * bic_2 = BIC of a 2-Gaussian fit = "there are two populations — a tight inner
+        group and a looser/farther outer group" = a hint the cluster is two shapes.
+      * BIC (Bayesian Information Criterion) rewards fit but penalises complexity, so
+        the extra parameters of the 2-component model must earn their place. LOWER
+        BIC wins; `preferred_n_components` is just argmin(bic_1, bic_2).
+      * Only the COMPARISON within one cluster is meaningful — never compare BIC
+        across clusters. Absolute BIC scales with member count and distance units,
+        so a 4000-member cluster and a 30-member cluster have incomparable magnitudes.
+      * Gap rule of thumb (delta = bic_1 - bic_2, positive favours 2 components):
+        <2 negligible, 2-6 weak, 6-10 strong, >10 very strong evidence for 2 groups.
+      * IMPORTANT: this tests the distance-to-centroid distribution, not shapes
+        directly. "2 components preferred" often just means a tight core plus a
+        diffuse halo of outliers (amplitude/tightness), not two distinct temporal
+        shapes. Only treat it as real sub-structure worth splitting when the
+        close-half vs far-half mean CURVES (panels 2..N) also differ in SHAPE.
+
     Normalization note: the pipeline applies NO per-site normalization, so the
     centroid and the half-means live in the same raw `data_type` magnitude space;
     axes are labelled with that data_type and nothing is mixed across spaces.

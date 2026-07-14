@@ -239,6 +239,49 @@ def run_all_pretreatment( # This function its applying pre-filtering
     return result
 
 
+def add_zscore_normalization(
+    df: pd.DataFrame,
+    cell_lines: list,
+    conditions: list = ["_EGF_", "_INS_", "_EGFnINS_"],
+    exclude_full: bool = False,
+) -> pd.DataFrame:
+    """
+    Add per-site z-score normalization of the temporal profile to an LFQ dataset.
+
+    Convenience entry point for LFQ data. It delegates to
+    src.transformations.compute_zscore_fc(), applying it once per cell line, so the
+    LFQ workflow gets log2:zscore columns without importing from src.transformations
+    directly. For each phosphosite (row), each (cell_line, condition) time series of
+    log2:FC values is standardised across its timepoints:
+
+        log2:zscore(condition, timepoint) =
+            (log2:FC(timepoint) − mean_t log2:FC) / std_t log2:FC
+
+    Note: run_all_transformations() already applies this same step, so calling this
+    is only needed to add z-scores to a DataFrame that was transformed WITHOUT it
+    (or to re-apply with a different `exclude_full`). Requires log2:FC columns to be
+    present already (i.e. run after run_all_transformations).
+
+    Args:
+        df: DataFrame that already has log2:FC columns (post run_all_transformations).
+        cell_lines: list of cell line identifiers used as column prefixes,
+            e.g. ['WT', 'BRAFS151A', 'GAB1Y259A'].
+        conditions: list of condition substrings to match, e.g. ['_EGF_'].
+        exclude_full: if True, drop the 'full' timepoint before computing the z-score
+            (default False).
+
+    Returns:
+        Copy of df with the new log2:zscore columns appended. The original is not modified.
+    """
+    from src.transformations import compute_zscore_fc
+
+    result = df.copy()
+    for cell_line in cell_lines:
+        result = compute_zscore_fc(result, cell_line=cell_line, conditions=conditions,
+                                   exclude_full=exclude_full)
+    return result
+
+
 
 # ---------------------------------------------------------------------------
 # 5. Cross-dataset matching
