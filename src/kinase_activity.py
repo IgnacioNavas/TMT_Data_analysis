@@ -67,12 +67,17 @@ def kinase_substrate_sets(df,
                           kinase_prefix="predicted_kinase",
                           top_n=5,
                           ranks=None,
-                          min_percentile=None,):
+                          min_percentile=None,
+                          groups=None,
+                          keep_members=False,):
     """
-    Map each kinase to the row-index of its predicted substrate sites.
+    Map each kinase (or merged kinase group) to the row-index of its predicted substrate sites.
 
     Thin wrapper over cluster_enrichment.kinase_membership() (same substrate definition, so
-    enrichment and activity analyses stay consistent).
+    enrichment and activity analyses stay consistent). When `groups` is given, paralogs are
+    merged: the group's substrate set is the **union** of its members' predicted substrates
+    (shared sites counted once), which is the statistically correct way to pool paralogs for
+    KSEA — the z-score's sqrt(m) term then reflects the true, deduplicated set size.
 
     Args:
         df: dataframe with predicted-kinase columns.
@@ -81,16 +86,20 @@ def kinase_substrate_sets(df,
         top_n: highest rank to scan when `ranks` is None (default 5).
         ranks: explicit ranks to scan (overrides top_n).
         min_percentile: require the matching *_prob >= this to count a substrate.
+        groups: optional manual paralog merge, e.g. {"ERK1/2": ["ERK1", "ERK2"]}.
+        keep_members: if True, keep individual members alongside the merged group.
 
     Returns:
-        dict {kinase: pandas Index of substrate site rows}.
+        dict {kinase-or-group: pandas Index of substrate site rows}.
     """
     membership = kinase_membership(df,
                                    kinases=kinases,
                                    kinase_prefix=kinase_prefix,
                                    top_n=top_n,
                                    ranks=ranks,
-                                   min_percentile=min_percentile,)
+                                   min_percentile=min_percentile,
+                                   groups=groups,
+                                   keep_members=keep_members,)
     return {kinase: membership.index[membership[kinase]] for kinase in membership.columns}
 
 
@@ -153,9 +162,12 @@ def kinase_activity_profile(df,
                             ranks=None,
                             min_percentile=90,
                             min_substrates=5,
-                            fdr_method="fdr_bh",):
+                            fdr_method="fdr_bh",
+                            groups=None,
+                            keep_members=False,):
     """
-    Compute a KSEA activity trajectory for each kinase across conditions and timepoints.
+    Compute a KSEA activity trajectory for each kinase (or merged group) across conditions
+    and timepoints.
 
     Substrate sets are built once from the predictions, then KSEA is run on each
     {cell_line}_{data_type}_{condition}_{timepoint} fold-change column. FDR correction is
@@ -175,18 +187,24 @@ def kinase_activity_profile(df,
             percentile >= 90 — a stringent, specificity-favouring set for activity inference).
         min_substrates: minimum quantified substrates to score a kinase (default 5).
         fdr_method: multipletests method applied per column (default BH).
+        groups: optional manual paralog merge, e.g. {"ERK1/2": ["ERK1", "ERK2"]}. Merged
+            groups are scored on the UNION of their members' substrates (see
+            kinase_substrate_sets) — the correct way to pool indistinguishable paralogs.
+        keep_members: if True, also profile the individual members alongside the group.
 
     Returns:
         Tidy long DataFrame with columns: kinase, condition, timepoint, n_substrates,
         mean_fc, z_score, p_value, q_value. `timepoint` is an ordered categorical so it plots
-        in the supplied order.
+        in the supplied order. Merged groups appear under their group name (e.g. "ERK1/2").
     """
     substrate_sets = kinase_substrate_sets(df,
                                            kinases=kinases,
                                            kinase_prefix=kinase_prefix,
                                            top_n=top_n,
                                            ranks=ranks,
-                                           min_percentile=min_percentile,)
+                                           min_percentile=min_percentile,
+                                           groups=groups,
+                                           keep_members=keep_members,)
     frames = []
     for condition in conditions:
         for timepoint in timepoints:

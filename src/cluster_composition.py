@@ -28,7 +28,8 @@ def kinase_cluster_table(df,
                          top_n=5,
                          ranks=None,
                          min_percentile=None,
-                         normalize=False,):
+                         normalize=False,
+                         groups=None,):
     """
     Count, per cluster, how many phosphosites each given kinase is predicted to phosphorylate.
 
@@ -36,24 +37,32 @@ def kinase_cluster_table(df,
     by default). Restrict to specific ranks with `ranks` (e.g. [1] for the top prediction only)
     and/or require a minimum percentile with `min_percentile`.
 
+    Paralogs can be merged manually: list the merged name in `kinases` and map it in `groups`,
+    e.g. kinases=["ERK1/2", "AKT1"], groups={"ERK1/2": ["ERK1", "ERK2"]}. A site then counts
+    for "ERK1/2" if ANY member is predicted (logical OR — a site with both is counted once,
+    never double-counted).
+
     Args:
         df: dataframe with cluster labels and predicted-kinase columns.
         cluster_col: name of the clustering column to group by (e.g.
             "KMeans_adaptive_cluster_WT_EGF_log2_FC").
-        kinases: kinase name or list of names to look up (matched case-insensitively).
+        kinases: kinase/group name or list of names to look up (matched case-insensitively);
+            a name present in `groups` is expanded to its members.
         kinase_prefix: prefix of the predicted-kinase columns (default "predicted_kinase",
             i.e. columns "{prefix}_{rank}" and "{prefix}_{rank}_prob").
         top_n: highest rank to scan when `ranks` is None (default 5).
         ranks: explicit list of ranks to scan (overrides top_n), e.g. [1, 2, 3].
         min_percentile: if given, only count a hit when the matching rank's *_prob >= this.
         normalize: if True, return each count as a fraction of the cluster's site total.
+        groups: optional manual paralog merge, e.g. {"ERK1/2": ["ERK1", "ERK2"]}.
 
     Returns:
-        DataFrame indexed by cluster (sorted), one column per kinase, values = site counts
-        (or per-cluster fractions if normalize=True).
+        DataFrame indexed by cluster (sorted), one column per kinase/group, values = site
+        counts (or per-cluster fractions if normalize=True).
     """
     if isinstance(kinases, str):
         kinases = [kinases]
+    groups = groups or {}
     scan_ranks = ranks if ranks is not None else range(1, top_n + 1)
 
     valid = df[df[cluster_col].notna()].copy()
@@ -61,13 +70,14 @@ def kinase_cluster_table(df,
 
     table = {}
     for kinase in kinases:
-        target = kinase.upper()
+        members = groups.get(kinase, [kinase])          # expand a merged group to its members
+        targets = {m.upper() for m in members}
         hit = pd.Series(False, index=valid.index)
         for rank in scan_ranks:
             name_col = f"{kinase_prefix}_{rank}"
             if name_col not in valid.columns:
                 continue
-            rank_hit = valid[name_col].astype("string").str.upper() == target
+            rank_hit = valid[name_col].astype("string").str.upper().isin(targets)
             if min_percentile is not None:
                 prob_col = f"{kinase_prefix}_{rank}_prob"
                 rank_hit &= pd.to_numeric(valid[prob_col], errors="coerce") >= min_percentile

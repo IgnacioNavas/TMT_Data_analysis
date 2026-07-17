@@ -608,10 +608,7 @@ def adaptive_kmeans_clustering(df_to_cluster,
     if time_series_length is None:
         raise ValueError("time_series_length is required")
     if metric != "euclidean":
-        raise NotImplementedError(
-            "adaptive_kmeans_clustering currently supports only metric='euclidean'; "
-            "DTW-based inertia is a planned extension."
-        )
+        raise NotImplementedError("adaptive_kmeans_clustering currently supports only metric='euclidean'; DTW-based inertia is a planned extension.")
     if inertia_mode not in ("total", "mean", "rms"):
         raise ValueError(f"inertia_mode must be 'total', 'mean' or 'rms', got {inertia_mode!r}")
 

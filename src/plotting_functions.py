@@ -1595,14 +1595,12 @@ def plot_sites_umap_interactive(
     import umap as umap_lib
     from src.column_spec import ColumnSpec
 
-    cols = ColumnSpec.select(
-        df,
-        cell_lines=cell_lines,
-        data_type=data_type,
-        conditions=conditions,
-        exclude_full=exclude_full,
-        exclude_replicate_cols=True,
-    )
+    cols = ColumnSpec.select(df,
+                             cell_lines=cell_lines,
+                             data_type=data_type,
+                             conditions=conditions,
+                             exclude_full=exclude_full,
+                             exclude_replicate_cols=True,)
     if not cols:
         raise ValueError(
             f"No columns found for cell_lines={cell_lines}, conditions={conditions}, "
@@ -1611,12 +1609,10 @@ def plot_sites_umap_interactive(
 
     X = df[cols].fillna(0).values
 
-    Z = umap_lib.UMAP(
-        n_components=2,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        random_state=random_state,
-    ).fit_transform(X)
+    Z = umap_lib.UMAP(n_components=2,
+                     n_neighbors=n_neighbors,
+                     min_dist=min_dist,
+                     random_state=random_state,).fit_transform(X)
 
     # --- Build metadata DataFrame ---
     umap_df = pd.DataFrame({"UMAP1": Z[:, 0], "UMAP2": Z[:, 1]}, index=df.index)
@@ -1638,26 +1634,22 @@ def plot_sites_umap_interactive(
 
     # --- Categorical vs continuous colour ---
     if color_col and color_col in umap_df.columns and pd.api.types.is_numeric_dtype(umap_df[color_col]):
-        fig = px.scatter(
-            umap_df,
-            x="UMAP1", y="UMAP2",
-            color=color_col,
-            hover_name="site" if "site" in umap_df.columns else None,
-            hover_data=hover_data,
-            color_continuous_scale="Viridis",
-            title=auto_title,
-            width=figsize[0], height=figsize[1],
-        )
+        fig = px.scatter(umap_df,
+                         x="UMAP1", y="UMAP2",
+                         color=color_col,
+                         hover_name="site" if "site" in umap_df.columns else None,
+                         hover_data=hover_data,
+                         color_continuous_scale="Viridis",
+                         title=auto_title,
+                         width=figsize[0], height=figsize[1],)
     else:
-        fig = px.scatter(
-            umap_df,
-            x="UMAP1", y="UMAP2",
-            color=color_col,
-            hover_name="site" if "site" in umap_df.columns else None,
-            hover_data=hover_data,
-            title=auto_title,
-            width=figsize[0], height=figsize[1],
-        )
+        fig = px.scatter(umap_df,
+                         x="UMAP1", y="UMAP2",
+                         color=color_col,
+                         hover_name="site" if "site" in umap_df.columns else None,
+                         hover_data=hover_data,
+                         title=auto_title,
+                         width=figsize[0], height=figsize[1],)
 
     fig.update_traces(marker=dict(size=4, opacity=0.6))
     fig.update_layout(plot_bgcolor="white", paper_bgcolor="white")

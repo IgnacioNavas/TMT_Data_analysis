@@ -97,6 +97,10 @@ src/                        Python modules
   clustering.py             Clustering utilities (tslearn KMeans/KShape/KernelKMeans, HDBSCAN, quality metrics)
   adaptive_clustering.py    Adaptive divisive+agglomerative KMeans (inertia-driven split then centroid merge)
   lfq_pretreatment.py       LFQ-specific preprocessing (mutant datasets)
+  kinase_prediction.py      Kinase imputation via kinase_library: UniProt ±7 windows, top-5 kinase + percentile prediction (TMT & LFQ)
+  cluster_composition.py    Cross-tabulate cluster labels vs annotations (which clusters contain sites of kinase X / protein Y)
+  cluster_enrichment.py     Fisher's-exact per-cluster enrichment of kinases / motifs / metadata (odds ratio, log2 enrichment, BH-FDR)
+  kinase_activity.py        KSEA kinase-activity inference (z-scores) across conditions × timepoints
   utils.py                  Shared utilities
 
 notebooks/
@@ -113,6 +117,9 @@ notebooks/
     clustering_overview.md      Reference document for all clustering strategies and parameters
   04_visualization/         Time series and profile plots
   05_downstream/            Downstream analysis (pathway enrichment, classifier)
+    kinase_prediction.ipynb                      Predict top-5 kinases + percentiles per site (uses src/kinase_prediction.py); adds cluster-composition demo (src/cluster_composition.py)
+    cluster_enrichment_and_kinase_activity.ipynb Fisher enrichment + KSEA, heavily documented for defense (src/cluster_enrichment.py, src/kinase_activity.py)
+    kinase_library_implementation.ipynb          LEGACY prototype — superseded by kinase_prediction.ipynb (kept for reference)
   scratch/                  Exploratory / throwaway notebooks
 
 Experiment/                 Raw and processed data per experiment
@@ -210,6 +217,18 @@ PhosphoSitePlus annotation columns (merged in preprocessing notebooks):
 | `ON_PROCESS` | Biological process associated with this site |
 | `ON_PROT_INTERACT` | Protein interactions regulated by this site |
 
+Kinase-prediction columns (added by `predict_top_kinases()` / `add_kinase_windows()` in `src/kinase_prediction.py`; flat per-site annotations — **not** the `{CellLine}_{DataType}_...` data-column scheme, so `ColumnSpec.select()` ignores them):
+
+| Column | Description |
+|--------|-------------|
+| `kinase_window` | ±7 (15-mer) sequence window centered on the phospho-acceptor, cut from the full UniProt protein sequence |
+| `kinase_residue` | The phospho-acceptor residue (S/T/Y); routes the site to the ser_thr vs tyrosine kinome |
+| `uniprot_seq_match` | QC flag: whether the detected peptide matches the UniProt sequence at its position (False ≈ isoform/mapping mismatch) |
+| `predicted_kinase_1` … `predicted_kinase_5` | Top-5 predicted kinases (rank 1 = most likely), from the kinase_library motif matrices |
+| `predicted_kinase_1_prob` … `predicted_kinase_5_prob` | Percentile score (0–100) of each predicted kinase — the "how likely" measure; non-increasing across ranks |
+
+Only computed for **single-localized** sites (TMT `LocalizedNumPhos == 1`; LFQ `n_localized == 1 & other_localized == 0`); other rows hold NaN.
+
 
 ## Data analysis overview
 
@@ -241,13 +260,37 @@ compensating for it.
 - Clustering implemented and working (TimeSeriesKMeans primary; KShape, KernelKMeans, HDBSCAN, autoencoder also explored)
 - Preprocessing and QC folder reports written (`REPORT_01_preprocessing.md`, `REPORT_02_qc.md`)
 - Clustering strategy documented (`notebooks/03_clustering/clustering_overview.md`)
+- Kinase imputation pipeline (`src/kinase_prediction.py`): UniProt-derived ±7 windows + top-5 kinase/percentile prediction, cross-dataset (TMT & LFQ), with sequence validation
+- Cluster-composition queries (`src/cluster_composition.py`): which clusters hold sites of given kinases / proteins
+- Downstream biology: Fisher's-exact cluster enrichment (`src/cluster_enrichment.py`) and KSEA kinase-activity inference (`src/kinase_activity.py`), both fully documented for defense
 
 **In progress / pending:**
 - Clustering optimisation (parameter tuning, optimal number of clusters)
 - Classifier training on WT cluster labels and transfer to mutant datasets
-- Downstream analysis (pathway enrichment, PhosX integration)
+- Downstream analysis: PhosX integration (Fisher enrichment + KSEA now done)
+- Kinase prediction on LFQ datasets: cross-dataset path implemented but only run on TMT hme1_2 so far (LFQ path smoke-tested, not run on a full mutant dataset)
 - LFQ preprocessing: add INS and EGFnINS conditions (currently EGF only)
 - TMT preprocessing: add filtering steps to match LFQ filtering (no-PTM, not-in-starve, missing-replicates)
+
+### Session 2026-07-16 — kinase imputation & cluster-label downstream analysis
+
+**Topics discussed:**
+- The `density=True` histogram y-axis in `diagnose_cluster_substructure` (probability density vs counts; why bar heights can exceed 1 — area, not height, sums to 1). Explanation added to `Adaptive_clustering_sweep.ipynb` and `Clustering.ipynb`.
+- Design of a clean, cross-dataset kinase-imputation workflow around the `kinase_library` package (v1.5.1, installed); why site percentile (0–100) is the defensible "how likely" metric; S/T vs Y kinome routing; single-localized-only scoring.
+- What further exploration of the cluster labels is worth doing before the classifier.
+
+**Implemented this session:**
+- `src/kinase_prediction.py` + `notebooks/05_downstream/kinase_prediction.ipynb` — top-5 kinases + percentiles per site. Windows cut from full UniProt sequences (`External_Data/Metadata/uniprotkb_..._de_compressed.tsv`) using absolute phospho positions (uniform for TMT/LFQ); `uniprot_seq_match` validation flag (hme1_2: 91 genuine peptide mismatches). Replaces the legacy `kinase_library_implementation.ipynb` (13-mer window, ser_thr-only, magic column slice).
+- `src/cluster_composition.py` — `kinase_cluster_table` / `protein_cluster_table` / `plot_cluster_composition`; demo cells appended to `kinase_prediction.ipynb`.
+- `src/cluster_enrichment.py` + `src/kinase_activity.py` + `notebooks/05_downstream/cluster_enrichment_and_kinase_activity.ipynb` — idea **#1** (Fisher enrichment: ERK/RSK/P38 substrates and ERK motifs enrich in specific clusters, BH-FDR) and idea **#2** (KSEA activity trajectories: recovers EGF→ERK/AKT dynamics; compares EGF/INS/co-stimulation). Notebook written with extensive statistical/biological documentation + limitations + references (Fisher, Benjamini-Hochberg, Casado 2013 KSEA, Wiredja 2017, Johnson 2023).
+
+**Ideas discussed but NOT yet implemented** (candidate next steps, roughly in priority order):
+- **#3 Label reliability / consensus** — cross-tabulate the 6 cluster columns (adaptive vs KMeans_11 × FC/scaled/zscore) with ARI + contingency to find sites with consistent vs flip-flopping labels; use to confidence-weight or filter classifier training data.
+- **#4 Condition-specificity / crosstalk within clusters** — classify sites/clusters as EGF-specific, INS-specific, shared, or synergistic (EGFnINS ≠ EGF+INS additive); the core crosstalk question.
+- **#5 Multi-site proteins** — do multiple sites on the same protein co-cluster or scatter across clusters (coordinated vs site-specific regulation)?
+- **#6 External MCF10A validation** — map homologous EGF-response sites onto the dynamic clusters.
+- **Classifier feature framing** — decide whether to predict cluster from temporal features (transfer/nearest-centroid to mutants → detect cluster-switching) vs from static features (sequence/kinase/motif → sites deviating in mutants are "rewired"). Noted as a design decision, not yet made.
+- **`posthoc_enrichment_fisher` stub** in `src/adaptive_clustering.py` is now superseded by `src/cluster_enrichment.py` (left in place, not wired).
 
 **Known issues:**
 - ~~`MSMS_data_QC.ipynb` loads data with `.fillna(0)` — this invalidates the missing value analysis and distorts CV and intensity distributions.~~ **FIXED (2026-07-09):** the four load lines now use `low_memory=False` instead of `.fillna(0)`, so missing intensities stay NaN (this also cleared the `DtypeWarning` on the sparse annotation columns). `peptide_count_per_sample()` in `src/QC.py` was the only QC function that counted NaN as detected (`df != missing_value`); it now uses `notna() & (df != missing_value)`, matching `replicate_detection_map`. All QC functions treat NaN as missing, so the `missing_value=0.0` arguments in the notebook cells are safe to keep.

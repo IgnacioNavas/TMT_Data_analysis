@@ -52,12 +52,54 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # 1. Membership builders — define the tested universe and the boolean matrix
 # ---------------------------------------------------------------------------
+def merge_kinase_groups(membership,
+                        groups,
+                        keep_members=False,):
+    """
+    Collapse paralog kinase columns of a boolean membership matrix into merged groups.
+
+    Paralogous kinases (e.g. ERK1/ERK2) share almost the same substrate motif, so the
+    matrices cannot tell them apart and it is often more honest to report them as one group.
+    The merge is a logical **OR** over the member columns: a site belongs to group "ERK1/2"
+    if it is a (predicted) substrate of ERK1 OR ERK2. This is the correct set-level union —
+    for downstream KSEA it means the group's substrate set is the union of its members' sets,
+    with shared sites counted once (never double-counted).
+
+    Args:
+        membership: boolean DataFrame (sites x kinases), from kinase_membership().
+        groups: manual mapping {group_name: [member_kinase, ...]}, e.g.
+            {"ERK1/2": ["ERK1", "ERK2"], "P38": ["P38A", "P38B", "P38D"]}. Matching is
+            case-insensitive; members absent from `membership` are ignored (with no error).
+        keep_members: if True, keep the individual member columns alongside the merged
+            group column; if False (default), drop them.
+
+    Returns:
+        Boolean DataFrame with the merged group columns added and (optionally) the member
+        columns removed. Ungrouped kinases are passed through unchanged.
+    """
+    result = membership.copy()
+    upper_to_col = {c.upper(): c for c in result.columns}
+    consumed = []
+    for group_name, members in groups.items():
+        present = [upper_to_col[m.upper()] for m in members if m.upper() in upper_to_col]
+        if not present:
+            continue
+        result[group_name] = result[present].any(axis=1)
+        consumed.extend(present)
+    if not keep_members:
+        drop = [c for c in set(consumed) if c not in groups]
+        result = result.drop(columns=drop,)
+    return result.astype(bool)
+
+
 def kinase_membership(df,
                       kinases=None,
                       kinase_prefix="predicted_kinase",
                       top_n=5,
                       ranks=None,
-                      min_percentile=None,):
+                      min_percentile=None,
+                      groups=None,
+                      keep_members=False,):
     """
     Build a boolean sites x kinases membership matrix from the predicted-kinase columns.
 
@@ -73,9 +115,14 @@ def kinase_membership(df,
         top_n: highest rank to scan when `ranks` is None (default 5).
         ranks: explicit ranks to scan (overrides top_n), e.g. [1] for the top call only.
         min_percentile: require the matching *_prob >= this to count a hit (default None).
+        groups: optional manual paralog merge, e.g. {"ERK1/2": ["ERK1", "ERK2"]}; merged
+            via merge_kinase_groups() (logical OR of member columns). Member kinases are
+            included in the build even if absent from `kinases`.
+        keep_members: if True, keep the individual member columns alongside merged groups.
 
     Returns:
-        Boolean DataFrame indexed by scored site, columns = kinase names (upper-cased).
+        Boolean DataFrame indexed by scored site, columns = kinase names (upper-cased),
+        with any `groups` collapsed into merged columns.
     """
     scan_ranks = list(ranks) if ranks is not None else list(range(1, top_n + 1))
     name_cols = [f"{kinase_prefix}_{r}" for r in scan_ranks if f"{kinase_prefix}_{r}" in df.columns]
@@ -89,6 +136,11 @@ def kinase_membership(df,
     else:
         columns = [k.upper() for k in ([kinases] if isinstance(kinases, str) else kinases)]
 
+    # Make sure group members are built even if not listed in `kinases`.
+    if groups is not None:
+        members = {m.upper() for member_list in groups.values() for m in member_list}
+        columns = sorted(set(columns) | members)
+
     membership = pd.DataFrame(False, index=scored.index, columns=columns)
     for rank in scan_ranks:
         name_col = f"{kinase_prefix}_{rank}"
@@ -101,7 +153,11 @@ def kinase_membership(df,
                 names = names.where(pd.to_numeric(scored[prob_col], errors="coerce") >= min_percentile)
         dummies = pd.get_dummies(names).reindex(columns=columns, fill_value=False).astype(bool)
         membership = membership | dummies
-    return membership.astype(bool)
+
+    membership = membership.astype(bool)
+    if groups is not None:
+        membership = merge_kinase_groups(membership, groups, keep_members=keep_members,)
+    return membership
 
 
 def annotation_membership(df,
