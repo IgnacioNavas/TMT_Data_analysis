@@ -11,8 +11,10 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.stats import ttest_ind
-from statsmodels.stats.multitest import multipletests
+# Statistics (p-values / FDR) are no longer computed here — they are done downstream
+# with the limma package in R. Imports kept commented for reference.
+# from scipy.stats import ttest_ind
+# from statsmodels.stats.multitest import multipletests
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -480,151 +482,158 @@ def compute_zscore_fc(df: pd.DataFrame,
     return result
 
 
-def compute_pvalues(df: pd.DataFrame,
-                    log2_groups: dict,
-                    cell_line: str = "WT") -> pd.DataFrame:
-    """
-    Compute unpaired t-test p-values comparing log2:abs replicates at each timepoint against the starve timepoint, per treatment.
+# ---------------------------------------------------------------------------
+# DEPRECATED — statistics moved to R/limma (2026-08-06)
+# ---------------------------------------------------------------------------
+# compute_pvalues / compute_fdr / compute_log10_fdr are no longer part of the
+# transformation pipeline. Differential statistics (moderated t / F, BH-FDR) are
+# computed downstream with the limma package in R. Kept commented for reference.
 
-    Uses scipy.stats.ttest_ind with equal_var=False (Welch's t-test).
-    Returns NaN for any (peptide, timepoint) where either group has fewer
-    than 2 valid (non-NaN) replicate values.
-
-    Output column names:
-        {cell_line}_log2:pvalue_{treatment}_{timepoint}
-
-    Args:
-        df: DataFrame with log2:abs replicate columns.
-        log2_groups: nested dict returned by compute_log2_abs(), structured as
-            {cell_line: {condition: {timepoint: [cols]}}}.
-        cell_line: cell line identifier prefix, e.g. 'WT'.
-
-    Returns:
-        Copy of df with the new log2:pvalue columns appended.
-    """
-    result = df.copy()
-    n_rows = len(df)
-    pvalue_cols = {}
-
-    for condition, timepoints in log2_groups[cell_line].items():
-        treatment = condition.strip('_')
-
-        if "starve" not in timepoints:
-            warnings.warn(
-                f"compute_pvalues: no log2:abs starve columns for treatment "
-                f"'{treatment}' — skipping p-values."
-            )
-            continue
-
-        starve_vals = result[timepoints["starve"]].values.astype(float)
-
-        for timepoint in _sort_timepoints([tp for tp in timepoints if tp != "starve"]):
-            tp_vals = result[timepoints[timepoint]].values.astype(float)
-            pvalues = np.full(n_rows, np.nan)
-
-            for i in range(n_rows):
-                sv = starve_vals[i][~np.isnan(starve_vals[i])]
-                tv = tp_vals[i][~np.isnan(tp_vals[i])]
-                if len(sv) >= 2 and len(tv) >= 2:
-                    _, p = ttest_ind(tv, sv, equal_var=False)
-                    pvalues[i] = p
-
-            result[f"{cell_line}_log2:pvalue_{treatment}_{timepoint}"] = pvalues
-
-    for col_name, pvalues in pvalue_cols.items():
-        result[col_name] = pvalues
-
-    return result
-
-
-def compute_fdr(df: pd.DataFrame,
-                cell_line: str = "WT") -> pd.DataFrame:
-    """
-    Apply Benjamini-Hochberg FDR correction to p-values across all peptides
-    for each (treatment, timepoint) comparison.
-
-    NaN p-values (peptides with insufficient replicates) are excluded from the
-    correction and remain NaN in the output.
-
-    Output column order: mirrors the order of the pvalue columns.
-    Output column names:
-        {cell_line}_log2:FDR_{treatment}_{timepoint}
-
-    Args:
-        df: DataFrame with log2:pvalue columns (produced by compute_pvalues).
-        cell_line: cell line identifier prefix, e.g. 'WT'.
-
-    Returns:
-        Copy of df with the new log2:FDR columns appended.
-    """
-    result = df.copy()
-    fdr_cols = {}
-
-    pval_cols = [c for c in result.columns if c.startswith(f"{cell_line}_log2:pvalue_")]
-    for pval_col in pval_cols:
-        fdr_col = pval_col.replace("_log2:pvalue_", "_log2:FDR_")
-
-        pvals = result[pval_col].values.astype(float)
-        valid_mask = ~np.isnan(pvals)
-        fdr_values = np.full(len(pvals), np.nan)
-
-        if valid_mask.sum() > 0:
-            _, fdr_corrected, _, _ = multipletests(pvals[valid_mask], method="fdr_bh")
-            fdr_values[valid_mask] = fdr_corrected
-
-        fdr_cols[fdr_col] = fdr_values
-
-    for col_name, fdr_values in fdr_cols.items():
-        result[col_name] = fdr_values
-
-    return result
-
-def compute_log10_fdr(df: pd.DataFrame,
-                      cell_line: str = "WT" ) -> pd.DataFrame:
-    """
-    Compute -log10(FDR) for each FDR column produced by compute_fdr().
-
-    NaN FDR values remain NaN.
-
-    Output column order: mirrors the order of the FDR columns.
-
-    Output column names:
-        {cell_line}_log2:adjustedFDR_{treatment}_{timepoint}
-
-    Args:
-        df: DataFrame with log2:FDR columns (produced by compute_fdr).
-        cell_line: cell line identifier prefix, e.g. 'WT'.
-
-    Returns:
-        Copy of df with the new -log10(FDR) columns appended.
-    """
-    result = df.copy()
-    log10_cols = {}
-
-    fdr_col_list = [c for c in result.columns if c.startswith(f"{cell_line}_log2:FDR_")]
-    for fdr_col in fdr_col_list:
-        log10_col = fdr_col.replace("_log2:FDR_", "_log2:adjustedFDR_")
-
-        fdr_vals = result[fdr_col].values.astype(float)
-
-        zero_mask = (fdr_vals == 0)
-        if zero_mask.sum() > 0:
-            warnings.warn(
-                f"compute_log10_fdr: {zero_mask.sum()} zero FDR value(s) in '{fdr_col}' "
-                f"would produce +inf — setting to NaN."
-            )
-            fdr_vals[zero_mask] = np.nan
-
-        log10_values = np.full(len(fdr_vals), np.nan)
-        valid_mask = ~np.isnan(fdr_vals)
-        log10_values[valid_mask] = -np.log10(fdr_vals[valid_mask])
-
-        log10_cols[log10_col] = log10_values
-
-    for col_name, log10_values in log10_cols.items():
-        result[col_name] = log10_values
-
-    return result
+# def compute_pvalues(df: pd.DataFrame,
+#                     log2_groups: dict,
+#                     cell_line: str = "WT") -> pd.DataFrame:
+#     """
+#     Compute unpaired t-test p-values comparing log2:abs replicates at each timepoint against the starve timepoint, per treatment.
+#
+#     Uses scipy.stats.ttest_ind with equal_var=False (Welch's t-test).
+#     Returns NaN for any (peptide, timepoint) where either group has fewer
+#     than 2 valid (non-NaN) replicate values.
+#
+#     Output column names:
+#         {cell_line}_log2:pvalue_{treatment}_{timepoint}
+#
+#     Args:
+#         df: DataFrame with log2:abs replicate columns.
+#         log2_groups: nested dict returned by compute_log2_abs(), structured as
+#             {cell_line: {condition: {timepoint: [cols]}}}.
+#         cell_line: cell line identifier prefix, e.g. 'WT'.
+#
+#     Returns:
+#         Copy of df with the new log2:pvalue columns appended.
+#     """
+#     result = df.copy()
+#     n_rows = len(df)
+#     pvalue_cols = {}
+#
+#     for condition, timepoints in log2_groups[cell_line].items():
+#         treatment = condition.strip('_')
+#
+#         if "starve" not in timepoints:
+#             warnings.warn(
+#                 f"compute_pvalues: no log2:abs starve columns for treatment "
+#                 f"'{treatment}' — skipping p-values."
+#             )
+#             continue
+#
+#         starve_vals = result[timepoints["starve"]].values.astype(float)
+#
+#         for timepoint in _sort_timepoints([tp for tp in timepoints if tp != "starve"]):
+#             tp_vals = result[timepoints[timepoint]].values.astype(float)
+#             pvalues = np.full(n_rows, np.nan)
+#
+#             for i in range(n_rows):
+#                 sv = starve_vals[i][~np.isnan(starve_vals[i])]
+#                 tv = tp_vals[i][~np.isnan(tp_vals[i])]
+#                 if len(sv) >= 2 and len(tv) >= 2:
+#                     _, p = ttest_ind(tv, sv, equal_var=False)
+#                     pvalues[i] = p
+#
+#             result[f"{cell_line}_log2:pvalue_{treatment}_{timepoint}"] = pvalues
+#
+#     for col_name, pvalues in pvalue_cols.items():
+#         result[col_name] = pvalues
+#
+#     return result
+#
+#
+# def compute_fdr(df: pd.DataFrame,
+#                 cell_line: str = "WT") -> pd.DataFrame:
+#     """
+#     Apply Benjamini-Hochberg FDR correction to p-values across all peptides
+#     for each (treatment, timepoint) comparison.
+#
+#     NaN p-values (peptides with insufficient replicates) are excluded from the
+#     correction and remain NaN in the output.
+#
+#     Output column order: mirrors the order of the pvalue columns.
+#     Output column names:
+#         {cell_line}_log2:FDR_{treatment}_{timepoint}
+#
+#     Args:
+#         df: DataFrame with log2:pvalue columns (produced by compute_pvalues).
+#         cell_line: cell line identifier prefix, e.g. 'WT'.
+#
+#     Returns:
+#         Copy of df with the new log2:FDR columns appended.
+#     """
+#     result = df.copy()
+#     fdr_cols = {}
+#
+#     pval_cols = [c for c in result.columns if c.startswith(f"{cell_line}_log2:pvalue_")]
+#     for pval_col in pval_cols:
+#         fdr_col = pval_col.replace("_log2:pvalue_", "_log2:FDR_")
+#
+#         pvals = result[pval_col].values.astype(float)
+#         valid_mask = ~np.isnan(pvals)
+#         fdr_values = np.full(len(pvals), np.nan)
+#
+#         if valid_mask.sum() > 0:
+#             _, fdr_corrected, _, _ = multipletests(pvals[valid_mask], method="fdr_bh")
+#             fdr_values[valid_mask] = fdr_corrected
+#
+#         fdr_cols[fdr_col] = fdr_values
+#
+#     for col_name, fdr_values in fdr_cols.items():
+#         result[col_name] = fdr_values
+#
+#     return result
+#
+# def compute_log10_fdr(df: pd.DataFrame,
+#                       cell_line: str = "WT" ) -> pd.DataFrame:
+#     """
+#     Compute -log10(FDR) for each FDR column produced by compute_fdr().
+#
+#     NaN FDR values remain NaN.
+#
+#     Output column order: mirrors the order of the FDR columns.
+#
+#     Output column names:
+#         {cell_line}_log2:adjustedFDR_{treatment}_{timepoint}
+#
+#     Args:
+#         df: DataFrame with log2:FDR columns (produced by compute_fdr).
+#         cell_line: cell line identifier prefix, e.g. 'WT'.
+#
+#     Returns:
+#         Copy of df with the new -log10(FDR) columns appended.
+#     """
+#     result = df.copy()
+#     log10_cols = {}
+#
+#     fdr_col_list = [c for c in result.columns if c.startswith(f"{cell_line}_log2:FDR_")]
+#     for fdr_col in fdr_col_list:
+#         log10_col = fdr_col.replace("_log2:FDR_", "_log2:adjustedFDR_")
+#
+#         fdr_vals = result[fdr_col].values.astype(float)
+#
+#         zero_mask = (fdr_vals == 0)
+#         if zero_mask.sum() > 0:
+#             warnings.warn(
+#                 f"compute_log10_fdr: {zero_mask.sum()} zero FDR value(s) in '{fdr_col}' "
+#                 f"would produce +inf — setting to NaN."
+#             )
+#             fdr_vals[zero_mask] = np.nan
+#
+#         log10_values = np.full(len(fdr_vals), np.nan)
+#         valid_mask = ~np.isnan(fdr_vals)
+#         log10_values[valid_mask] = -np.log10(fdr_vals[valid_mask])
+#
+#         log10_cols[log10_col] = log10_values
+#
+#     for col_name, log10_values in log10_cols.items():
+#         result[col_name] = log10_values
+#
+#     return result
 
 
 def run_all_transformations(df: pd.DataFrame,
@@ -644,9 +653,9 @@ def run_all_transformations(df: pd.DataFrame,
         5. log2:FC  (fold change vs. starve, per treatment)
         6. log2:scaled (max-normalized fold change)
         7. log2:zscore (per-site z-score of the temporal profile, per condition per cell line)
-        8. log2:pvalue (Welch t-test vs. starve, per treatment × timepoint)
-        9. log2:FDR (Benjamini-Hochberg correction per treatment × timepoint)
-        10. log2:adjustedFDR
+
+    No statistics (p-values / FDR) are computed here — differential testing is done
+    downstream with the limma package in R.
 
     All cell lines share the same output DataFrame — their derived columns are
     simply appended side-by-side.  Cell lines that have no matching columns are
@@ -691,9 +700,10 @@ def run_all_transformations(df: pd.DataFrame,
         result = compute_fold_change(result, log2_groups, cell_line=cell_line)
         result = compute_scaled_fc(result, cell_line=cell_line, conditions=conditions)
         result = compute_zscore_fc(result, cell_line=cell_line, conditions=conditions)
-        result = compute_pvalues(result, log2_groups, cell_line=cell_line)
-        result = compute_fdr(result, cell_line=cell_line)
-        result = compute_log10_fdr(result, cell_line=cell_line)
+        # Statistics removed — p-values / FDR are computed downstream with limma (R):
+        # result = compute_pvalues(result, log2_groups, cell_line=cell_line)
+        # result = compute_fdr(result, cell_line=cell_line)
+        # result = compute_log10_fdr(result, cell_line=cell_line)
 
         print(f"[{cell_line}] Done. Added {result.shape[1] - cols_before} columns.")
 
@@ -854,6 +864,81 @@ def merge_phosphoplus_info(df: pd.DataFrame,
         result[info] = result.apply(lambda row: get_column_infos(row["protein_Id"], row["_loc_label"], phospho_lookup), axis=1)
 
     result = result.drop(columns=["_loc_label"])
+    return result
+
+
+#----------------------
+# Merging limma statistics
+#----------------------
+
+def merge_limma_results(df: pd.DataFrame,
+                        limma_path: str,
+                        key: str = "site",
+                        verbose: bool = True) -> pd.DataFrame:
+    """
+    Merge the limma statistics table into a transformed dataset.
+
+    The statistics themselves are computed in R by
+    notebooks/01_preprocessing/limma_for_pvalues.rmd, which writes one
+    {dataset}_limma_pvalues.tsv per dataset keyed by `site`. This function joins that
+    table back onto the Python frame so the rest of the pipeline can use the p-values.
+
+    The merge is a left join on `key`, so every row of df is kept. Sites that limma did not
+    test (those below its MIN_PLEX threshold, i.e. detected in too few TMT plexes to have a
+    variance estimate) receive NaN rather than being dropped.
+
+    Re-running the merge is safe: any limma column already present in df is removed first,
+    so the join never produces _x / _y suffixed duplicates.
+
+    Args:
+        df: transformed dataset containing the key column.
+        limma_path: path to the {dataset}_limma_pvalues.tsv written by the R notebook.
+        key: column to join on, default 'site'.
+        verbose: if True, print how many sites carry statistics after the merge.
+
+    Returns:
+        Copy of df with the limma columns appended. The original DataFrame is not modified.
+    """
+    limma_df = pd.read_csv(limma_path, sep="\t", low_memory=False)
+
+    if key not in df.columns:
+        raise KeyError(f"merge_limma_results: '{key}' not found in the dataset columns.")
+    if key not in limma_df.columns:
+        raise KeyError(f"merge_limma_results: '{key}' not found in '{limma_path}'.")
+
+    if limma_df[key].duplicated().any():
+        raise ValueError(
+            f"merge_limma_results: '{key}' is not unique in '{limma_path}' — "
+            f"the join would duplicate rows."
+        )
+    if df[key].duplicated().any():
+        warnings.warn(
+            f"merge_limma_results: '{key}' is not unique in the dataset — "
+            f"limma statistics will be repeated across the duplicated rows."
+        )
+
+    stat_cols = [col for col in limma_df.columns if col != key]
+
+    # Drop any previous merge so re-running does not create _x / _y suffixes.
+    already_present = [col for col in stat_cols if col in df.columns]
+    result = df.drop(columns=already_present) if already_present else df.copy()
+    if already_present and verbose:
+        print(f"  replacing {len(already_present)} limma column(s) from a previous merge")
+
+    result = result.merge(limma_df, on=key, how="left")
+
+    if verbose:
+        matched = result[stat_cols[0]].notna().sum()
+        unmatched_in_limma = (~limma_df[key].isin(df[key])).sum()
+        print(f"  merged {len(stat_cols)} limma columns from {limma_path}")
+        print(f"  {matched} / {len(result)} sites carry statistics "
+              f"({len(result) - matched} not tested by limma)")
+        if unmatched_in_limma:
+            warnings.warn(
+                f"merge_limma_results: {unmatched_in_limma} site(s) in '{limma_path}' "
+                f"are absent from the dataset and were discarded by the left join."
+            )
+
     return result
 
 

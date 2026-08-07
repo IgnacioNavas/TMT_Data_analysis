@@ -4,4 +4,38 @@
     <option name="sdkName" value="Python 3.13" />
   </component>
   <component name="ProjectRootManager" version="2" project-jdk-name="TMT_Data_analysis" project-jdk-type="Python SDK" />
+  <component name="RMarkdownSettings">
+    <option name="renderProfiles">
+      <map>
+        <entry key="file://$USER_HOME$/Nextcloud/PhD/MSMS_orders/Order_37142_2024_11_29_HEK293T/DEA_20250205_WUo37142_Starve_vsn-2/Inputs_WU_o37142_Starve/_DiffExpQC.Rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$USER_HOME$/Nextcloud/PhD/MSMS_orders/Order_37142_2024_11_29_HEK293T/DEA_20250205_WUo37142_Starve_vsn-2/Inputs_WU_o37142_Starve" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+        <entry key="file://$USER_HOME$/Nextcloud/PhD/MSMS_orders/Order_37142_2024_11_29_HEK293T/DEA_20250205_WUo37142_Starve_vsn-2/Inputs_WU_o37142_Starve/_Grp2Analysis_V2.Rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$USER_HOME$/Nextcloud/PhD/MSMS_orders/Order_37142_2024_11_29_HEK293T/DEA_20250205_WUo37142_Starve_vsn-2/Inputs_WU_o37142_Starve" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+        <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/Limma.rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+        <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/limma_for_pvalues.rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
 </project>

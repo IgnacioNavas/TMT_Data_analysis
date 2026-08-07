@@ -154,6 +154,58 @@ def get_dynamics_columns(
     return df[cols].copy()
 
 
+def filter_incomplete_timeseries(
+    df: pd.DataFrame,
+    cell_lines: list,
+    conditions: list,
+    data_type: str = "log2:FC",
+    exclude_full: bool = True,
+    max_missing: int = 0,
+) -> pd.DataFrame:
+    """
+    Remove sites with missing (NaN) values in the time-series columns used for clustering.
+
+    Clustering (e.g. KMeans) needs a complete numeric vector per site: a single NaN in any
+    timepoint of the selected series makes the Euclidean distance undefined and raises
+    "Input contains NaN". Such holes come from sites that were not quantified at some
+    timepoint (typically the sparse n:reps==1 tail of TMT data, where a peptide has no
+    reporter intensity in any replicate at a given timepoint). Columns are resolved with
+    ColumnSpec.select(), so the check targets exactly the columns the clustering will use.
+
+    This is the alternative to the `.fillna(0)` convention: instead of imputing the missing
+    timepoints as "no change vs starve", drop the affected sites entirely.
+
+    Args:
+        df: DataFrame following the project naming convention.
+        cell_lines: list of cell-line prefixes, e.g. ["WT"].
+        conditions: list of condition substrings, e.g. ["_EGF_", "_INS_", "_EGFnINS_"].
+        data_type: data-type string of the clustering values (default "log2:FC").
+        exclude_full: if True, exclude the 'full' timepoint from the check (default True);
+            set this to match how the clustering selects its columns.
+        max_missing: maximum number of missing timepoints tolerated per row (default 0,
+            i.e. keep only rows with a fully complete series). Rows with more than
+            `max_missing` NaNs across the selected columns are dropped.
+
+    Returns:
+        Filtered DataFrame copy (rows whose selected time series has <= max_missing NaNs).
+    """
+    cols = ColumnSpec.select(
+        df,
+        cell_lines=cell_lines,
+        data_type=data_type,
+        conditions=conditions,
+        exclude_full=exclude_full,
+        exclude_replicate_cols=True,
+    )
+    if not cols:
+        raise ValueError(
+            f"No columns found for cell_lines={cell_lines}, conditions={conditions}, "
+            f"data_type={data_type!r}. Check naming convention and available columns."
+        )
+    n_missing = df[cols].isna().sum(axis=1)
+    return df.loc[n_missing <= max_missing].copy()
+
+
 def filter_by_localization(
     df: pd.DataFrame,
     min_localized: int = 1,

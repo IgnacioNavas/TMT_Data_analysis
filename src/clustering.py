@@ -58,8 +58,7 @@ def reshape_df(df,
             print(f"Reshaping dataframe to shape {multivariate_df.shape}")
             # After transpose: (n_samples, len_time_serie, dimensions) → (5000, 6, 3)
 
-    # --- Stoichiometry reweighting ---
-    # by defaulft : {"_EGF_": 1, "_INS_": 1, "_EGFnINS_": 1}
+    # --- Stoichiometry reweighting --- by defaulft : {"_EGF_": 1, "_INS_": 1, "_EGFnINS_": 1}
     # Requires transpose=True so that axis 2 is the conditions dimension.
     if stoichiometry is not None:
         if not transpose:
@@ -80,7 +79,7 @@ def reshape_df(df,
             print(f"Conditions detected:   {list(representative_cols)}")
             print(f"Stoichiometry applied: {condition_multipliers}")
 
-        # Repeat each condition slice along axis=2 according to its multiplier
+        # Repeat each condition slice along axis=2 according to its multiplier.
         # multivariate_df shape after transpose: (n_samples, len_time_serie, n_conditions)
         repeated_slices = []
         for cond_idx, multiplier in enumerate(condition_multipliers):

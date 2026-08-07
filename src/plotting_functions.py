@@ -20,6 +20,51 @@ from src.transformations import parse_columns
 # Plotting helpers functions adjusted to the column naming system (CellLine)_(DataType)_(Treatment)_(TimePoint)
 #---------------------
 
+
+def build_legend(legend_plot,
+                 color_palette,):
+    """Build explicit legend handles and display labels for a figure legend.
+
+    Matplotlib silently ignores any legend label that starts with an
+    underscore (its reserved "hidden artist" convention). Because this
+    project's palette/condition keys are written as `_EGF_`, `_INS_`,
+    `_EGFnINS_`, passing them straight to ``fig.legend(labels=...)`` makes
+    those entries vanish, so only part of the legend is drawn. This helper
+    creates one proxy line handle per entry (coloured from ``color_palette``)
+    and strips the surrounding underscores from the labels, so the full
+    legend always renders.
+
+    Args:
+      legend_plot: List of label strings to show, in the same order as the
+        plotted series (conditions or cell lines).
+      color_palette: Either a dict mapping condition/cell-line keys to colours
+        or a list/tuple of colours. Colours are matched to ``legend_plot``
+        positionally (dict values are used in insertion order).
+
+    Returns:
+      Tuple ``(handles, labels)`` ready to pass to ``fig.legend`` as
+      ``fig.legend(handles=handles, labels=labels, ...)``. Labels have any
+      leading/trailing underscores removed (falling back to the original
+      string if stripping leaves it empty).
+    """
+    if isinstance(color_palette, dict):
+        colors = list(color_palette.values())
+    else:
+        colors = list(color_palette)
+
+    handles = []
+    labels = []
+    for i, entry in enumerate(legend_plot):
+        clean = str(entry).strip("_")
+        labels.append(clean if clean else str(entry))
+        color = colors[i] if i < len(colors) else "black"
+        handles.append(plt.Line2D([0], [0],
+                                   color=color,
+                                   marker='o',
+                                   linestyle='-',))
+    return handles, labels
+
+
 def plot_data(ax,
               row_df,
               data_type="",
@@ -114,7 +159,8 @@ def plot_single_phosphosite(row,
 
     ax.set_xlim(-1, len_x)
 
-    fig.legend(labels=legend_plot, loc="upper right", ncol=max(len(legend_plot), 1))
+    _handles, _labels = build_legend(legend_plot, color_palette)
+    fig.legend(handles=_handles, labels=_labels, loc="upper right", ncol=max(len(_labels), 1))
     fig.suptitle(f"{saving_folder} {site_label} {title_info} ({date.today()})", weight='bold')
     fig.tight_layout()
 
@@ -290,7 +336,8 @@ def plot_protein_phosphosites(df,
                     axes[i, j].set_xlim(-1, len_x)
                     k += 1
 
-            fig.legend(labels=legend_plot, loc="upper right", ncol=max(len(legend_plot), 1))
+            _handles, _labels = build_legend(legend_plot, color_palette)
+            fig.legend(handles=_handles, labels=_labels, loc="upper right", ncol=max(len(_labels), 1))
             fig.suptitle(f"{saving_folder} {cell_lines} {conditions} {title_info} ({date.today()})", weight='bold')
             fig.tight_layout()
 
@@ -450,7 +497,8 @@ def plot_dataset_phosphosites(df,
                 axes[i, j].set_xlim(-1, len_x)
                 k += 1
 
-        fig.legend(labels=legend_plot, loc="upper right", ncol=max(len(legend_plot), 1))
+        _handles, _labels = build_legend(legend_plot, color_palette)
+        fig.legend(handles=_handles, labels=_labels, loc="upper right", ncol=max(len(_labels), 1))
         fig.suptitle(
             f"{dataset_name} {cluster_column} {cluster_number} {title_info} ({date.today()})",
             weight='bold'
