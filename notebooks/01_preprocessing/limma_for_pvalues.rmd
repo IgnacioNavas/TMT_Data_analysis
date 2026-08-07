@@ -1,0 +1,1075 @@
+---
+title: "limma — p-values of each timepoint against the starve control"
+output: html_notebook
+---
+
+# Purpose
+
+Compute, for every phosphosite, the statistical significance of each stimulation timepoint
+against the **starve** control, using the `log2:abs` data produced by
+`TMT_dataset_preprocessing.ipynb` / `src/transformations.py`.
+
+This replaces the Welch t-test / Benjamini-Hochberg functions that used to live in
+`src/transformations.py` (`compute_pvalues`, `compute_fdr`, `compute_log10_fdr`, now commented
+out there). With only 4 replicates the per-site variance estimate has 3 degrees of freedom and
+is very unstable; **limma** shrinks each site's variance toward a prior fitted across all sites
+(Smyth 2004), which is the whole reason for moving the statistics to R.
+
+Three families of results are produced:
+
+1. **Per timepoint × condition** — moderated *t* contrast against starve: log fold change,
+   p-value, BH-FDR and adjusted p-value (`-log10(FDR)`).
+2. **Per condition** — omnibus moderated *F* across that condition's stimulation timepoints:
+   *"is this site EGF-responsive at all?"*
+3. **Global, per site** — omnibus moderated *F* across every timepoint of every condition:
+   *"does this site respond to anything, at any time?"*
+
+**The data is already log2-transformed** (`log2:abs`). No further transformation is applied —
+`lmFit` expects data on the log scale, which is exactly what it gets here.
+
+# The design: why the plex has to be in the model
+
+Each replicate `r1 … r4` **is one TMT plex**. Each plex contains 17 real channels —
+`full`, `starve`, and 5 stimulation timepoints for each of EGF / INS / EGFnINS — so all
+comparisons of interest live *inside* a single plex.
+
+The requirement is that each timepoint is compared to the starve control **of its own
+replicate**, never to another replicate's. In limma this is the standard paired/blocked design
+(limma User's Guide §9.4):
+
+```
+~ 0 + group + plex
+```
+
+The `plex` term absorbs each plex's overall offset, so every `group − starve` contrast is
+estimated *within* plex. The residual variance is then pooled across plexes and shrunk across
+sites by `eBayes`. This is strictly better than subtracting the starve channel by hand and
+testing the ratios, because the pooled fit keeps the degrees of freedom that hand-made ratios
+throw away.
+
+## A structural detail of these files: the controls are duplicated
+
+There are 84 `log2:abs` columns, but only **68 real samples**. `full` and `starve` are
+physically one channel per plex, yet they appear in the table three times — once under each
+condition arm (`..._EGF_starve_r1`, `..._INS_starve_r1`, `..._EGFnINS_starve_r1` hold identical
+values).
+
+Feeding all 84 columns to `lmFit` would enter the starve control **three times**, which is
+pseudo-replication: it would inflate the residual degrees of freedom and shrink the variance
+estimate, making everything look more significant than it is. The code below therefore keeps
+only one copy of each control and *asserts* that the discarded copies were identical.
+
+# Caveat: no between-sample normalisation is applied
+
+This notebook fits `log2:abs` **exactly as stored on disk** (`NORMALIZE <- "none"`), which is a
+deliberate choice, not an oversight.
+
+The consequence should be stated plainly: the 68 channel medians span about **1.58 log2** in
+`hme1_2`, and still span 0.49–1.11 log2 *within* a single plex. The `plex` term removes the
+plex-level offset but **not** per-channel loading differences, so each contrast inherits a
+systematic shift in its log fold change. This is the defect documented in
+`notebooks/03_clustering/clustering_method_decision.md` §1 (median `log2:FC` of +0.566 across
+all sites at EGF 5 min). It biases the *point estimate*, not just the variance.
+
+`NORMALIZE` is left as a parameter so median-centring or quantile normalisation can be switched
+on later without touching any of the analysis code.
+
+# Parameters
+
+Paths are resolved from the **project root**, which is located by walking up from the current
+working directory until a folder containing `data/`, `src/` and `notebooks/` is found. Relative
+paths like `../../data/...` cannot be used here: knitting the notebook runs with this file's
+folder as the working directory, but running the chunks from the PyCharm / RStudio console runs
+with the project root, and the same relative path cannot mean both.
+
+Each dataset keeps its own folder, `Experiment/{dataset}/Data/Processed/`, so only the file
+*name* is listed per dataset and the folder is built from the dataset key. Outputs go back into
+that same folder — one limma table per experiment rather than a flat pile in `Experiment/` —
+and are named after the input's stem, so the date prefix carries over
+(`20260807_hTERT_HEM1_2_log2_processed.tsv` → `20260807_hTERT_HEM1_2_limma_pvalues.tsv`).
+
+```{r setup}
+suppressPackageStartupMessages(library(limma))
+
+find_project_root <- function(start = getwd(),
+                              markers = c("data", "src", "notebooks")) {
+  # Locate the project root by walking up the directory tree from `start`.
+  #
+  # Makes the notebook runnable from any working directory — knitted (working directory =
+  # this file's folder) or run chunk-by-chunk from a console rooted at the project.
+  #
+  # Args:
+  #   start: directory to start searching from, default the current working directory.
+  #   markers: directory names that must all be present for a folder to count as the root.
+  #
+  # Returns:
+  #   Absolute path to the project root. Raises an error if no ancestor directory qualifies.
+
+  path <- normalizePath(start, mustWork = TRUE)
+
+  repeat {
+    if (all(dir.exists(file.path(path, markers)))) {
+      return(path)
+    }
+    parent <- dirname(path)
+    if (identical(parent, path)) {
+      stop("find_project_root: no ancestor of '", start, "' contains all of: ",
+           paste(markers, collapse = ", "),
+           ". Set PROJECT_ROOT manually to the TMT_Data_analysis folder.")
+    }
+    path <- parent
+  }
+}
+
+PROJECT_ROOT <- find_project_root()
+DATA_DIR     <- file.path(PROJECT_ROOT, "Experiment")
+
+# Each dataset lives in its own experiment folder, with the processed input under
+# Experiment/{dataset}/Data/Processed/. Only the file name has to be listed here; the folder is
+# built from the dataset key, so nothing in this notebook holds an absolute path.
+PROCESSED_SUBDIR <- file.path("Data", "Processed")
+
+DATASET_FILES <- list(hek_1  = "20260807_HEK293T_log2_processed.tsv",
+                      hme1_1 = "20260807_hTERT_HEM1_1_log2_processed.tsv",
+                      hme1_2 = "20260807_hTERT_HEM1_2_log2_processed.tsv")
+
+DATA_FILES <- vapply(names(DATASET_FILES),
+                     function(dataset_name) {
+                       file.path(DATA_DIR,
+                                 dataset_name,
+                                 PROCESSED_SUBDIR,
+                                 DATASET_FILES[[dataset_name]])
+                     },
+                     character(1))
+
+CELL_LINE  <- "WT"          # column prefix of the cell line to analyse
+CONTROL    <- "starve"      # reference timepoint for every contrast
+CONDITIONS <- c("EGF", "INS", "EGFnINS")
+MIN_PLEX   <- 2             # minimum number of plexes a site must be detected in (see below)
+NORMALIZE  <- "none"        # "none" | "median" | "quantile"
+OUT_SUFFIX <- "_limma_pvalues.tsv"
+
+# --- debugging switches ---------------------------------------------------------------
+# MAX_SITES caps the number of sites fitted, so the whole notebook can be smoke-tested in
+# seconds before committing to a full run. Set to Inf for the real analysis.
+MAX_SITES  <- Inf           # e.g. 2000 to time the pipeline end-to-end first
+VERBOSE    <- TRUE          # per-stage timing checkpoints
+
+
+limma_output_path <- function(dataset_name,
+                              data_files = DATA_FILES,
+                              out_suffix = OUT_SUFFIX) {
+  # Build the output path of one dataset's limma table, next to that dataset's input file.
+  #
+  # Results are written into the same Experiment/{dataset}/Data/Processed/ folder the input was
+  # read from, so each experiment folder stays self-contained. The name reuses the input's stem
+  # (date + dataset), so the date prefix of the processed file carries over to the statistics.
+  #
+  # Args:
+  #   dataset_name: dataset key, e.g. "hme1_2"; must be a name of `data_files`.
+  #   data_files: named vector of input file paths.
+  #   out_suffix: suffix appended to the input stem, including the extension.
+  #
+  # Returns:
+  #   Absolute path of the .tsv to write. Never equal to the input path.
+
+  input_path <- data_files[[dataset_name]]
+  stem <- sub("_log2_processed\\.tsv$", "", basename(input_path))
+  stem <- sub("\\.tsv$", "", stem)          # fallback if the input is named differently
+
+  output_path <- file.path(dirname(input_path), paste0(stem, out_suffix))
+  if (!dir.exists(dirname(output_path))) {
+    stop("limma_output_path: output folder '", dirname(output_path), "' does not exist.")
+  }
+  if (identical(output_path, input_path)) {
+    stop("limma_output_path: refusing to overwrite the input file '", input_path, "'.")
+  }
+  output_path
+}
+
+cat("limma version:", as.character(packageVersion("limma")), "\n")
+cat("working directory:", getwd(), "\n")
+cat("project root     :", PROJECT_ROOT, "\n\n")
+
+missing_files <- DATA_FILES[!file.exists(DATA_FILES)]
+if (length(missing_files) > 0) {
+  stop("input file(s) not found:\n  ", paste(missing_files, collapse = "\n  "))
+}
+for (dataset_name in names(DATA_FILES)) {
+  cat(sprintf("  %-8s in : %s\n", dataset_name, DATA_FILES[[dataset_name]]))
+  cat(sprintf("  %-8s out: %s\n", "",           limma_output_path(dataset_name)))
+}
+```
+
+## Why `MIN_PLEX = 2`
+
+Missingness in TMT is **per plex, not per channel**: a peptide is either selected for MS2 in a
+given run — yielding reporter ions in all 17 channels — or it is not. So a site is fully
+present or fully absent within each plex, and `n:reps` is exactly the number of plexes it was
+detected in.
+
+A site detected in **one** plex contributes 17 observations to a model with 17 estimable
+parameters, giving `df.residual = 0`. `eBayes` will still happily return a p-value for it,
+computed entirely from the prior variance with *zero* site-specific evidence. Those numbers are
+not defensible, so such sites are dropped. Raise `MIN_PLEX` to 3 or 4 for a stricter analysis.
+
+# Progress checkpoints
+
+Every stage announces itself **before** it runs and reports its duration after, and each line is
+flushed immediately. So if the run stalls, the **last line printed is the stage it is stuck in** —
+which is the whole point: a stage that never prints its `done` line is the culprit.
+
+`report_memory()` is included because the most likely cause of a job that should take seconds
+taking an hour is not arithmetic but **swapping**. If `used` climbs into the GB range, the machine
+is paging and every subsequent operation is disk-bound.
+
+`muffle_warnings()` addresses the other classic cause. `lmFit` can emit one warning *per site*, and
+while `Rscript` shrugs that off, an IDE notebook re-rendering tens of thousands of warning lines can
+take orders of magnitude longer than the computation itself. Warnings are counted and summarised
+instead of streamed.
+
+```{r checkpoints}
+.timing <- new.env(parent = emptyenv())
+
+checkpoint <- function(label,
+                       reset = FALSE) {
+  # Print a flushed, timestamped progress line with the time since the previous checkpoint.
+  #
+  # Args:
+  #   label: description of the stage being reported.
+  #   reset: TRUE to restart the total-elapsed clock (use at the start of a dataset).
+  #
+  # Returns:
+  #   Invisibly, seconds elapsed since the previous checkpoint.
+
+  if (!VERBOSE) {
+    return(invisible(0))
+  }
+
+  now <- proc.time()[["elapsed"]]
+  if (reset || is.null(.timing$start)) {
+    .timing$start <- now
+    .timing$last  <- now
+  }
+  since_last  <- now - .timing$last
+  since_start <- now - .timing$start
+  .timing$last <- now
+
+  cat(sprintf("[%s | +%7.1fs | %7.1fs total] %s\n",
+              format(Sys.time(), "%H:%M:%S"),
+              since_last,
+              since_start,
+              label))
+  flush.console()
+  invisible(since_last)
+}
+
+
+stage <- function(label,
+                  expr) {
+  # Run one stage, announcing it before evaluation and timing it after.
+  #
+  # `expr` is passed unevaluated and forced inside, so the "starting" line is guaranteed to be
+  # printed and flushed before any work begins. A stage that hangs therefore leaves its own name
+  # as the last thing on screen.
+  #
+  # Args:
+  #   label: short description of the stage, e.g. "lmFit".
+  #   expr: the expression to evaluate.
+  #
+  # Returns:
+  #   The value of `expr`.
+
+  if (VERBOSE) {
+    cat(sprintf("[%s]   -> %-42s ", format(Sys.time(), "%H:%M:%S"), paste0(label, " ...")))
+    flush.console()
+  }
+
+  started <- proc.time()[["elapsed"]]
+  value   <- force(expr)
+  elapsed <- proc.time()[["elapsed"]] - started
+
+  if (VERBOSE) {
+    cat(sprintf("done in %7.1fs\n", elapsed))
+    flush.console()
+  }
+  value
+}
+
+
+report_memory <- function(label = "") {
+  # Print the memory currently used by R, to expose swapping as a cause of a slow run.
+  #
+  # Args:
+  #   label: optional tag printed alongside the figures.
+  #
+  # Returns:
+  #   Invisibly, total megabytes in use.
+
+  if (!VERBOSE) {
+    return(invisible(0))
+  }
+
+  # gc() returns a variable number of columns — a "limit (Mb)" column appears on some platforms,
+  # so the megabyte columns must be located by name rather than by position. The first "(Mb)"
+  # column is current usage, the last is the peak since the session started.
+  usage   <- gc(verbose = FALSE)
+  mb_cols <- which(colnames(usage) == "(Mb)")
+  used    <- sum(usage[, mb_cols[1]])
+  peak    <- if (length(mb_cols) > 1) sum(usage[, mb_cols[length(mb_cols)]]) else NA_real_
+
+  cat(sprintf("[%s]      memory: %6.0f MB in use%s  %s\n",
+              format(Sys.time(), "%H:%M:%S"),
+              used,
+              if (is.na(peak)) "" else sprintf(", %6.0f MB peak", peak),
+              label))
+  flush.console()
+  invisible(used)
+}
+
+
+muffle_warnings <- function(expr,
+                            label = "stage") {
+  # Evaluate an expression, collecting warnings instead of emitting them one by one.
+  #
+  # limma emits one warning per problematic site; tens of thousands of them can dominate the
+  # runtime of an IDE notebook even though the computation itself is fast. This counts them and
+  # prints a summary of the distinct messages.
+  #
+  # Args:
+  #   expr: expression to evaluate.
+  #   label: tag used in the printed summary.
+  #
+  # Returns:
+  #   The value of `expr`.
+
+  collected <- character(0)
+
+  value <- withCallingHandlers(
+    expr,
+    warning = function(w) {
+      collected <<- c(collected, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    })
+
+  if (length(collected) > 0 && VERBOSE) {
+    counts <- sort(table(collected), decreasing = TRUE)
+    cat(sprintf("[%s]      %d warning(s) in %s:\n",
+                format(Sys.time(), "%H:%M:%S"), length(collected), label))
+    for (i in seq_len(min(5, length(counts)))) {
+      cat(sprintf("           %6d x  %s\n", counts[[i]], names(counts)[i]))
+    }
+    flush.console()
+  }
+  value
+}
+```
+
+# Functions
+
+```{r functions}
+parse_abs_columns <- function(column_names,
+                              cell_line,
+                              conditions) {
+  # Parse the log2:abs column names of one cell line into their component fields.
+  #
+  # Args:
+  #   column_names: character vector of all column names in the dataset.
+  #   cell_line: cell line prefix to keep, e.g. "WT".
+  #   conditions: character vector of condition names, e.g. c("EGF", "INS", "EGFnINS").
+  #
+  # Returns:
+  #   data.frame with one row per log2:abs column and the columns
+  #   `column`, `condition`, `timepoint`, `plex`.
+
+  pattern <- paste0("^", cell_line, "_log2:abs_(",
+                    paste(conditions, collapse = "|"),
+                    ")_([^_]+)_(r[0-9]+)$")
+
+  matched <- grep(pattern, column_names, value = TRUE)
+  if (length(matched) == 0) {
+    stop("parse_abs_columns: no log2:abs columns found for cell line '", cell_line, "'.")
+  }
+
+  fields <- regmatches(matched, regexec(pattern, matched))
+
+  data.frame(column    = matched,
+             condition = vapply(fields, `[`, character(1), 2),
+             timepoint = vapply(fields, `[`, character(1), 3),
+             plex      = vapply(fields, `[`, character(1), 4),
+             stringsAsFactors = FALSE)
+}
+
+
+deduplicate_controls <- function(df,
+                                 column_info,
+                                 conditions,
+                                 control_timepoints = c("full", "starve")) {
+  # Remove the duplicated control columns that appear once per condition arm.
+  #
+  # `full` and `starve` are a single physical channel per plex but are written out under every
+  # condition. Only the copy belonging to the first condition is kept, and the discarded copies
+  # are checked to be identical to it first — if a future dataset stops duplicating them, this
+  # raises rather than silently averaging different samples.
+  #
+  # Args:
+  #   df: the full dataset, used only to compare the duplicated columns.
+  #   column_info: data.frame returned by parse_abs_columns().
+  #   conditions: character vector of condition names; the first one is kept.
+  #   control_timepoints: timepoints that are shared across condition arms.
+  #
+  # Returns:
+  #   column_info restricted to unique samples, with an added `group` column giving the
+  #   experimental group of each sample (control timepoints keep their bare name).
+
+  keep_condition <- conditions[1]
+
+  for (timepoint in control_timepoints) {
+    for (plex in unique(column_info$plex)) {
+      reference <- column_info$column[column_info$condition == keep_condition &
+                                      column_info$timepoint == timepoint &
+                                      column_info$plex      == plex]
+      if (length(reference) != 1) next
+
+      for (other_condition in conditions[-1]) {
+        duplicate <- column_info$column[column_info$condition == other_condition &
+                                        column_info$timepoint == timepoint &
+                                        column_info$plex      == plex]
+        if (length(duplicate) != 1) next
+
+        if (!isTRUE(all.equal(df[[reference]], df[[duplicate]]))) {
+          stop("deduplicate_controls: '", duplicate, "' is not identical to '", reference,
+               "'. The control channels are not duplicates in this dataset — ",
+               "the design must be rebuilt before fitting.")
+        }
+      }
+    }
+  }
+
+  is_duplicate_control <- column_info$timepoint %in% control_timepoints &
+                          column_info$condition != keep_condition
+  unique_info <- column_info[!is_duplicate_control, , drop = FALSE]
+
+  unique_info$group <- ifelse(unique_info$timepoint %in% control_timepoints,
+                              unique_info$timepoint,
+                              paste(unique_info$condition, unique_info$timepoint, sep = "_"))
+
+  unique_info
+}
+
+
+sort_timepoints <- function(timepoints) {
+  # Sort timepoint labels in biological order: named controls first, then numerically.
+  #
+  # Args:
+  #   timepoints: character vector of timepoint labels, e.g. c("10", "full", "2", "starve").
+  #
+  # Returns:
+  #   The same labels, ordered with "full" and "starve" first and the numeric points ascending.
+
+  named   <- c("full", "starve")
+  present <- named[named %in% timepoints]
+  numeric_points <- setdiff(timepoints, named)
+  c(present, numeric_points[order(as.numeric(numeric_points))])
+}
+
+
+normalize_matrix <- function(M,
+                             method) {
+  # Apply between-sample normalisation to the expression matrix.
+  #
+  # Args:
+  #   M: numeric matrix, sites in rows and samples in columns, on the log2 scale.
+  #   method: "none" (return unchanged), "median" (centre every column on the grand median),
+  #     or "quantile" (limma::normalizeBetweenArrays).
+  #
+  # Returns:
+  #   The normalised matrix, same dimensions and dimnames as the input.
+
+  if (method == "none") {
+    return(M)
+  }
+  if (method == "median") {
+    column_medians <- apply(M, 2, median, na.rm = TRUE)
+    return(sweep(M, 2, column_medians) + mean(column_medians))
+  }
+  if (method == "quantile") {
+    return(normalizeBetweenArrays(M, method = "quantile"))
+  }
+  stop("normalize_matrix: unknown method '", method, "'.")
+}
+
+
+build_contrasts <- function(groups,
+                            control,
+                            design) {
+  # Build the contrast matrix of every group against the control group.
+  #
+  # Args:
+  #   groups: character vector of group names to contrast against the control.
+  #   control: name of the control group, e.g. "starve".
+  #   design: design matrix whose column names define the coefficient names.
+  #
+  # Returns:
+  #   Contrast matrix with one column per group, named after the group.
+
+  expressions <- paste0("group", groups, " - group", control)
+  contrast_matrix <- makeContrasts(contrasts = expressions, levels = design)
+  colnames(contrast_matrix) <- groups
+  contrast_matrix
+}
+
+
+order_by_datatype <- function(results,
+                              cell_line,
+                              labels,
+                              f_names) {
+  # Reorder the result columns so each data type forms one contiguous block.
+  #
+  # The natural assembly order is per contrast (all four statistics of EGF_2, then all four of
+  # EGF_5, ...). This flips it to per data type: every limmaFC column with its timepoints in
+  # order, then every pvalue column, then FDR, then adjustedFDR, then the F-test blocks.
+  #
+  # Args:
+  #   results: assembled results data.frame, keyed by `site`.
+  #   cell_line: cell line column prefix, e.g. "WT".
+  #   labels: contrast labels ("EGF_full", "EGF_2", ...) in the desired timepoint order.
+  #   f_names: names of the F-tests, e.g. c("EGF", "INS", "EGFnINS", "ALL").
+  #
+  # Returns:
+  #   The same data.frame with its columns reordered. Raises if the reordering would drop or
+  #   invent a column.
+
+  contrast_stats <- c("limmaFC", "pvalue", "FDR", "adjustedFDR")
+  f_stats        <- c("Fpvalue", "FFDR", "adjustedFFDR")
+
+  ordered <- "site"
+  for (statistic in contrast_stats) {
+    ordered <- c(ordered, paste0(cell_line, "_log2:", statistic, "_", labels))
+  }
+  for (statistic in f_stats) {
+    ordered <- c(ordered, paste0(cell_line, "_log2:", statistic, "_", f_names, "_omnibus"))
+  }
+
+  if (!setequal(ordered, colnames(results))) {
+    stop("order_by_datatype: the reordered column list does not match the assembled one.")
+  }
+
+  results[, ordered, drop = FALSE]
+}
+
+
+add_test_columns <- function(results,
+                             p_values,
+                             prefix) {
+  # Append p-value, BH-FDR and adjusted p-value columns for one test to the results frame.
+  #
+  # The adjusted p-value is -log10(FDR), matching the project's `adjustedFDR` convention.
+  # An FDR of exactly 0 would give +Inf and is set to NA instead.
+  #
+  # Args:
+  #   results: data.frame being assembled, one row per site.
+  #   p_values: numeric vector of raw p-values, in the row order of `results`.
+  #   prefix: column-name stem, e.g. "WT_log2:pvalue_EGF_5" without the statistic part;
+  #     the three columns are built from the `pvalue` / `FDR` / `adjustedFDR` variants.
+  #
+  # Returns:
+  #   The results data.frame with three new columns appended.
+
+  fdr <- p.adjust(p_values, method = "BH")
+  adjusted <- -log10(fdr)
+  adjusted[is.infinite(adjusted)] <- NA_real_
+
+  results[[prefix$pvalue]]      <- p_values
+  results[[prefix$fdr]]         <- fdr
+  results[[prefix$adjustedfdr]] <- adjusted
+  results
+}
+```
+
+# The analysis
+
+```{r read-dataset}
+read_dataset <- function(file_path,
+                         dataset_name) {
+  # Read one processed dataset and report everything needed to explain a slow or wrong run.
+  #
+  # The file is read once per dataset and reused by the fit and both verification steps, rather
+  # than being re-read three times. The diagnostics printed here answer, in order: is the file
+  # the size we think it is, did it parse into the expected shape, are the intensity columns
+  # numeric, and are missing values stored as NA rather than as 0 (see the note below).
+  #
+  # Args:
+  #   file_path: path to the processed .tsv.
+  #   dataset_name: dataset key, used in the printed report.
+  #
+  # Returns:
+  #   The dataset as a data.frame, with column names untouched.
+
+  size_mb <- file.size(file_path) / 1e6
+  cat(sprintf("[%s]      file: %.0f MB  %s\n",
+              format(Sys.time(), "%H:%M:%S"), size_mb, basename(file_path)))
+  flush.console()
+
+  df <- stage(sprintf("read.delim (%.0f MB)", size_mb),
+              read.delim(file_path,
+                         sep = "\t",
+                         check.names = FALSE,
+                         na.strings = c("NA", "NaN", ""),
+                         stringsAsFactors = FALSE))
+
+  cat(sprintf("[%s]      parsed: %d rows x %d columns\n",
+              format(Sys.time(), "%H:%M:%S"), nrow(df), ncol(df)))
+
+  abs_columns <- grep("_log2:abs_", colnames(df), value = TRUE)
+  non_numeric <- abs_columns[!vapply(df[abs_columns], is.numeric, logical(1))]
+  if (length(non_numeric) > 0) {
+    cat(sprintf("      WARNING: %d log2:abs column(s) did not parse as numeric, e.g. %s\n",
+                length(non_numeric), paste(head(non_numeric, 3), collapse = ", ")))
+  }
+
+  # Missingness must be NA. If a fillna(0) reached this file, the zeros are read as real
+  # intensities: limma then sees a complete matrix, takes its fast path, and returns confident
+  # nonsense. This is the defect recorded in clustering_method_decision.md §1.
+  numeric_abs <- abs_columns[vapply(df[abs_columns], is.numeric, logical(1))]
+  if (length(numeric_abs) > 0) {
+    values    <- as.matrix(df[numeric_abs])
+    n_missing <- sum(is.na(values))
+    n_zero    <- sum(values == 0, na.rm = TRUE)
+    cat(sprintf("      log2:abs cells: %.1f%% NA, %.1f%% exactly zero\n",
+                100 * n_missing / length(values),
+                100 * n_zero / length(values)))
+    if (n_zero > 0.01 * length(values)) {
+      cat("      WARNING: many exact zeros in log2:abs — missing values may have been\n",
+          "               written as 0 instead of NA. Fix before trusting any p-value.\n", sep = "")
+    }
+  }
+
+  report_memory(sprintf("after reading %s", dataset_name))
+  flush.console()
+  df
+}
+```
+
+```{r run-limma}
+run_limma_dataset <- function(df,
+                              dataset_name,
+                              cell_line = CELL_LINE,
+                              control = CONTROL,
+                              conditions = CONDITIONS,
+                              min_plex = MIN_PLEX,
+                              normalize = NORMALIZE,
+                              max_sites = MAX_SITES) {
+  # Fit the blocked limma model on one dataset and return the full table of statistics.
+  #
+  # Every stimulation timepoint is contrasted against the control timepoint within its own
+  # plex, using the design ~ 0 + group + plex. Three sets of statistics are produced: the
+  # moderated t contrast per timepoint, an omnibus moderated F per condition, and one global
+  # omnibus F per site across all conditions.
+  #
+  # Args:
+  #   df: the dataset as returned by read_dataset() — read once and reused, so the file is not
+  #     parsed again here.
+  #   dataset_name: short name of the dataset, used in the printed report.
+  #   cell_line: cell line column prefix to analyse.
+  #   control: control timepoint every contrast is taken against.
+  #   conditions: condition names present in the column headers.
+  #   min_plex: minimum value of `n:reps` for a site to be tested.
+  #   normalize: between-sample normalisation method passed to normalize_matrix().
+  #   max_sites: cap on the number of sites fitted, for smoke-testing; Inf for a real run.
+  #
+  # Returns:
+  #   data.frame with one row per tested site: the `site` key followed by the logFC / pvalue /
+  #   FDR / adjustedFDR columns per timepoint and the F-test columns per condition and global.
+
+  cat("\n=====", dataset_name, "=====\n")
+  checkpoint(paste("fitting", dataset_name), reset = TRUE)
+
+  stopifnot(!anyDuplicated(df$site))
+  stopifnot("n:reps" %in% colnames(df))
+
+  # --- samples -------------------------------------------------------------------------
+  column_info <- stage("parse log2:abs column names",
+                       parse_abs_columns(colnames(df), cell_line, conditions))
+  cat("     log2:abs columns:", nrow(column_info), "\n")
+
+  samples <- stage("de-duplicate control channels",
+                   deduplicate_controls(df, column_info, conditions))
+  cat("     unique sample channels after de-duplicating the controls:", nrow(samples), "\n")
+
+  timepoints <- sort_timepoints(unique(column_info$timepoint))
+  cat("     timepoints:", paste(timepoints, collapse = ", "), "\n")
+
+  group_levels <- c(control,
+                    setdiff(c("full", "starve"), control),
+                    unlist(lapply(conditions, function(condition) {
+                      paste(condition,
+                            setdiff(timepoints, c("full", "starve")),
+                            sep = "_")
+                    })))
+  group_levels <- group_levels[group_levels %in% samples$group]
+
+  samples$group <- factor(samples$group, levels = group_levels)
+  samples$plex  <- factor(samples$plex)
+
+  # --- expression matrix ---------------------------------------------------------------
+  tested <- df[["n:reps"]] >= min_plex
+  tested[is.na(tested)] <- FALSE
+  if (is.finite(max_sites) && sum(tested) > max_sites) {
+    tested[which(tested)[-seq_len(max_sites)]] <- FALSE
+    cat("     NOTE: MAX_SITES is set — only", max_sites, "sites will be fitted.\n")
+  }
+  cat("     sites tested (n:reps >=", min_plex, "):", sum(tested), "of", nrow(df),
+      " | dropped:", sum(!tested), "\n")
+
+  M <- stage("build expression matrix",
+             as.matrix(df[tested, samples$column, drop = FALSE]))
+  rownames(M) <- df$site[tested]
+  storage.mode(M) <- "double"
+  M <- stage(paste0("normalise (", normalize, ")"), normalize_matrix(M, normalize))
+  cat("     matrix:", nrow(M), "sites x", ncol(M), "samples | ",
+      sprintf("%.1f%% NA", 100 * sum(is.na(M)) / length(M)), "\n")
+
+  # Missingness is supposed to be plex-wise: within one plex a site is either present in all 17
+  # channels or absent from all of them. A "partial" plex block breaks the premise behind
+  # MIN_PLEX and means n:reps no longer equals the number of plexes the site was seen in.
+  # (The number of distinct patterns is not the right check — with 4 plexes and n:reps in 2..4
+  # there are legitimately C(4,2)+C(4,3)+C(4,4) = 11 of them.)
+  partial_blocks <- 0
+  for (plex_level in levels(samples$plex)) {
+    block   <- is.na(M[, samples$plex == plex_level, drop = FALSE])
+    n_na    <- rowSums(block)
+    partial_blocks <- partial_blocks + sum(n_na > 0 & n_na < ncol(block))
+  }
+  total_blocks <- nrow(M) * nlevels(samples$plex)
+  cat(sprintf("     plex blocks partially missing: %d of %d (%.2f%%)%s\n",
+              partial_blocks, total_blocks, 100 * partial_blocks / total_blocks,
+              if (partial_blocks == 0) " — plex-wise, as expected" else
+                " — missingness is NOT purely plex-wise; n:reps may not mean what MIN_PLEX assumes"))
+
+  # --- design and fit ------------------------------------------------------------------
+  design <- model.matrix(~ 0 + group + plex, data = samples)
+  colnames(design) <- make.names(colnames(design))
+  cat("     design:", nrow(design), "x", ncol(design),
+      " | rank:", qr(design)$rank, "\n")
+  stopifnot(qr(design)$rank == ncol(design))
+
+  cat(sprintf("     lmFit will fit %d sites x %d coefficients%s\n",
+              nrow(M), ncol(design),
+              if (anyNA(M)) " (per-site loop: NAs present)" else " (single QR: no NAs)"))
+  fit <- stage("lmFit", muffle_warnings(lmFit(M, design), "lmFit"))
+  report_memory("after lmFit")
+
+  # --- contrasts -----------------------------------------------------------------------
+  stimulation_timepoints <- setdiff(timepoints, c("full", "starve"))
+  contrast_groups <- setdiff(levels(samples$group), control)
+
+  fit_t <- stage(sprintf("t-contrasts + eBayes (%d contrasts)", length(contrast_groups)),
+                 muffle_warnings(
+                   eBayes(contrasts.fit(fit,
+                                        build_contrasts(contrast_groups, control, design)),
+                          trend = TRUE,
+                          robust = TRUE),
+                   "t-contrasts"))
+
+  f_groups <- list()
+  for (condition in conditions) {
+    f_groups[[condition]] <- paste(condition, stimulation_timepoints, sep = "_")
+  }
+  f_groups[["ALL"]] <- unlist(f_groups, use.names = FALSE)
+
+  f_fits <- list()
+  for (f_name in names(f_groups)) {
+    f_fits[[f_name]] <- stage(sprintf("omnibus F: %s", f_name),
+                              muffle_warnings(
+                                eBayes(contrasts.fit(fit,
+                                                     build_contrasts(f_groups[[f_name]],
+                                                                     control,
+                                                                     design)),
+                                       trend = TRUE,
+                                       robust = TRUE),
+                                paste("F test", f_name)))
+  }
+  report_memory("after all fits")
+
+  # --- assemble ------------------------------------------------------------------------
+  # `contrast_groups` is already in reporting order: full first, then each condition with its
+  # timepoints ascending. `labels` keeps that order and is reused to order the output columns.
+  labels <- vapply(contrast_groups,
+                   function(group) {
+                     if (group %in% timepoints) paste0(conditions[1], "_", group) else group
+                   },
+                   character(1),
+                   USE.NAMES = FALSE)
+
+  results <- stage("assemble result columns", {
+    assembled <- data.frame(site = rownames(M), stringsAsFactors = FALSE)
+
+    for (i in seq_along(contrast_groups)) {
+      group <- contrast_groups[i]
+      label <- labels[i]
+
+      assembled[[paste0(cell_line, "_log2:limmaFC_", label)]] <- fit_t$coefficients[, group]
+      assembled <- add_test_columns(assembled,
+                                    fit_t$p.value[, group],
+                                    list(pvalue      = paste0(cell_line, "_log2:pvalue_", label),
+                                         fdr         = paste0(cell_line, "_log2:FDR_", label),
+                                         adjustedfdr = paste0(cell_line, "_log2:adjustedFDR_", label)))
+    }
+
+    for (name in names(f_fits)) {
+      assembled <- add_test_columns(assembled,
+                                    f_fits[[name]]$F.p.value,
+                                    list(pvalue      = paste0(cell_line, "_log2:Fpvalue_", name, "_omnibus"),
+                                         fdr         = paste0(cell_line, "_log2:FFDR_", name, "_omnibus"),
+                                         adjustedfdr = paste0(cell_line, "_log2:adjustedFFDR_", name, "_omnibus")))
+    }
+    assembled
+  })
+
+  results <- stage("reorder columns by data type",
+                   order_by_datatype(results, cell_line, labels, names(f_fits)))
+  checkpoint(sprintf("%s fitted: %d sites x %d columns",
+                     dataset_name, nrow(results), ncol(results)))
+
+  # --- report --------------------------------------------------------------------------
+  cat("\nsites at FDR < 0.05 per contrast:\n")
+  for (label in labels) {
+    fdr_col <- paste0(cell_line, "_log2:FDR_", label)
+    cat(sprintf("  %-16s %4d / %d\n", label,
+                sum(results[[fdr_col]] < 0.05, na.rm = TRUE), nrow(results)))
+  }
+  cat("sites at F-test FDR < 0.05:\n")
+  for (name in names(f_fits)) {
+    fdr_col <- paste0(cell_line, "_log2:FFDR_", name, "_omnibus")
+    cat(sprintf("  %-16s %4d / %d\n", name,
+                sum(results[[fdr_col]] < 0.05, na.rm = TRUE), nrow(results)))
+  }
+
+  results
+}
+```
+```{r}
+
+```
+
+The `Partial NA coefficients for N probe(s)` warning below is **expected and benign**. When a
+site is absent from a whole plex, that plex's indicator column becomes all-zero in the reduced
+design and its coefficient is inestimable — but the missing coefficient is a *plex* nuisance
+term, never a group term, so the contrasts remain valid and `df.residual` is correctly reduced
+(48 for a 4-plex site, 32 for 3 plexes, 16 for 2 plexes).
+
+Each file is read **once** and the parsed frame is kept in `limma_inputs`, so the fit and both
+verification steps below reuse it instead of re-parsing the same TSV three times.
+
+```{r fit-all-datasets}
+limma_inputs  <- list()
+limma_results <- list()
+
+checkpoint("starting all datasets", reset = TRUE)
+for (dataset_name in names(DATA_FILES)) {
+  cat("\n===== reading", dataset_name, "=====\n")
+  limma_inputs[[dataset_name]]  <- read_dataset(DATA_FILES[[dataset_name]], dataset_name)
+  limma_results[[dataset_name]] <- run_limma_dataset(limma_inputs[[dataset_name]], dataset_name)
+}
+checkpoint("all datasets fitted")
+report_memory("end of fitting")
+```
+
+# Verification
+
+The critical claim is that each timepoint is compared to the starve control **of its own
+replicate**. That is checked numerically rather than asserted: for a site detected in all four
+plexes, limma's `logFC` must equal the mean of the four within-plex differences
+`x[timepoint, ri] − x[starve, ri]`.
+
+```{r verify-within-plex}
+verify_within_plex <- function(df,
+                               results,
+                               cell_line = CELL_LINE,
+                               control = CONTROL,
+                               checks = c("EGF_5", "INS_10", "EGFnINS_90")) {
+  # Check that limma's logFC equals the mean of the per-plex differences against the control.
+  #
+  # Args:
+  #   df: the dataset that was fitted, as returned by read_dataset() — reused rather than
+  #     re-read from disk.
+  #   results: results data.frame returned by run_limma_dataset().
+  #   cell_line: cell line column prefix.
+  #   control: control timepoint used as the contrast reference.
+  #   checks: contrasts to verify, each named "{condition}_{timepoint}".
+  #
+  # Returns:
+  #   Invisibly, the maximum absolute discrepancy found across the checked sites.
+
+  complete <- df[df[["n:reps"]] == 4, , drop = FALSE]
+  complete <- complete[complete$site %in% results$site, , drop = FALSE]
+  if (nrow(complete) == 0) {
+    cat("no complete (4-plex) sites available to verify\n")
+    return(invisible(NA_real_))
+  }
+
+  plexes <- c("r1", "r2", "r3", "r4")
+  worst  <- 0
+
+  for (check in checks) {
+    parts     <- strsplit(check, "_")[[1]]
+    condition <- parts[1]
+    timepoint <- parts[2]
+
+    fc_col <- paste0(cell_line, "_log2:limmaFC_", check)
+    if (!fc_col %in% colnames(results)) next
+
+    manual <- rowMeans(sapply(plexes, function(plex) {
+      complete[[paste0(cell_line, "_log2:abs_", condition, "_", timepoint, "_", plex)]] -
+      complete[[paste0(cell_line, "_log2:abs_", condition, "_", control, "_", plex)]]
+    }))
+
+    from_limma <- results[[fc_col]][match(complete$site, results$site)]
+    discrepancy <- max(abs(manual - from_limma), na.rm = TRUE)
+    worst <- max(worst, discrepancy)
+
+    cat(sprintf("  %-12s n=%d  max |limma - within-plex mean| = %.3e\n",
+                check, nrow(complete), discrepancy))
+  }
+
+  invisible(worst)
+}
+
+for (dataset_name in names(DATA_FILES)) {
+  cat("\n", dataset_name, "\n", sep = "")
+  worst <- stage(paste("verify within-plex contrast:", dataset_name),
+                 verify_within_plex(limma_inputs[[dataset_name]],
+                                    limma_results[[dataset_name]]))
+  stopifnot(is.na(worst) || worst < 1e-9)
+}
+checkpoint("within-plex contrast verified for all datasets")
+```
+
+A second sanity check: the limma log fold change should track the existing mean-based
+`log2:FC` column computed by the Python pipeline. They are not identical — limma estimates the
+contrast inside the blocked model and only over the plexes where the site was seen — but on
+complete sites they should agree closely.
+
+```{r verify-against-pipeline}
+for (dataset_name in names(DATA_FILES)) {
+  df      <- limma_inputs[[dataset_name]]
+  results <- limma_results[[dataset_name]]
+
+  matched   <- match(results$site, df$site)
+  pipeline  <- df[[paste0(CELL_LINE, "_log2:FC_EGF_5")]][matched]
+  new_value <- results[[paste0(CELL_LINE, "_log2:limmaFC_EGF_5")]]
+
+  cat(sprintf("%-8s correlation(limmaFC, log2:FC) at EGF 5 min = %.4f\n",
+              dataset_name,
+              cor(pipeline, new_value, use = "complete.obs")))
+}
+```
+
+```{r verify-ranges}
+for (dataset_name in names(DATA_FILES)) {
+  results <- limma_results[[dataset_name]]
+  p_cols <- grep("pvalue|FDR", colnames(results), value = TRUE)
+  p_cols <- grep("adjusted", p_cols, value = TRUE, invert = TRUE)
+  values <- unlist(results[, p_cols], use.names = FALSE)
+
+  stopifnot(all(is.na(values) | (values >= 0 & values <= 1)))
+  cat(sprintf("%-8s %d sites x %d columns | all p-values and FDRs within [0, 1]\n",
+              dataset_name, nrow(results), ncol(results)))
+}
+```
+
+# Write the results
+
+Results are written to a **separate** file keyed by `site`, in the same
+`Experiment/{dataset}/Data/Processed/` folder the input came from, never back over the input
+(`limma_output_path()` raises if the two paths ever collide). Merging them into the Python
+frames (`pandas.merge(df, limma, on="site", how="left")`) is a downstream step, not part of
+this notebook.
+
+```{r write-results}
+for (dataset_name in names(DATA_FILES)) {
+  out_path <- limma_output_path(dataset_name)
+  stage(paste("write", basename(out_path)),
+        write.table(limma_results[[dataset_name]],
+                    file = out_path,
+                    sep = "\t",
+                    row.names = FALSE,
+                    quote = FALSE,
+                    na = "NA"))
+  cat("     wrote", out_path,
+      "  (", nrow(limma_results[[dataset_name]]), "sites x",
+      ncol(limma_results[[dataset_name]]), "columns,",
+      round(file.size(out_path) / 1e6), "MB )\n")
+}
+checkpoint("all results written")
+```
+
+# If the run is slow
+
+Benchmarked on simulated matrices of exactly this shape (68 channels, 20 coefficients, ~25%
+missing), the arithmetic is not the expensive part: `lmFit` plus all five `eBayes` fits take
+**~7 s at 50 000 sites**, assembly ~0.1 s and `write.table` ~2 s. A full three-dataset run should
+be on the order of a minute. If it takes far longer, the checkpoints above will name the stage —
+and the likely causes are, in order:
+
+1. **Warning flooding in the IDE.** `lmFit` can emit one warning per site. `Rscript` absorbs that;
+   an IDE notebook re-rendering tens of thousands of console lines does not. `muffle_warnings()`
+   now collects and summarises them. If this was the cause, the fix is already in place.
+2. **Swapping.** Watch the `memory:` lines. `read.delim` can transiently use several times the
+   file size, and once the machine pages, everything becomes disk-bound. Reading each file once
+   instead of three times (above) cuts the peak substantially.
+3. **A much wider file than expected.** The `parsed: N rows x M columns` line says so directly.
+4. **Missing values stored as `0` rather than `NA`.** This does not make the run slow — it makes it
+   *fast and wrong*, because limma sees a complete matrix and takes its single-QR path. The
+   `% exactly zero` diagnostic in `read_dataset()` catches it.
+
+To time it cheaply before committing to a full run, set `MAX_SITES <- 2000` in the parameters
+chunk. And prefer running the whole file with `Rscript -e 'rmarkdown::render("limma_for_pvalues.rmd")'`
+over stepping through chunks in the IDE — the console rendering, not the statistics, is the part
+that scales badly.
+
+# Output columns
+
+For each condition × timepoint, contrasted against `starve` within plex:
+
+| Column | Meaning |
+|---|---|
+| `WT_log2:limmaFC_EGF_5` | log2 fold change vs starve, estimated inside the blocked model. Named `limmaFC` rather than `FC` so it does not collide with the mean-based `log2:FC` already produced by the Python pipeline |
+| `WT_log2:pvalue_EGF_5` | moderated *t* p-value |
+| `WT_log2:FDR_EGF_5` | Benjamini-Hochberg FDR, applied across sites within that contrast |
+| `WT_log2:adjustedFDR_EGF_5` | `-log10(FDR)` |
+
+Omnibus *F*-tests, per site:
+
+| Column | Meaning |
+|---|---|
+| `WT_log2:Fpvalue_EGF_omnibus` | is this site different from starve at **any** EGF timepoint? (likewise `INS`, `EGFnINS`) |
+| `WT_log2:Fpvalue_ALL_omnibus` | is this site different from starve at **any** timepoint of **any** condition? |
+| `..._FFDR_..._omnibus`, `..._adjustedFFDR_..._omnibus` | BH-FDR and `-log10(FDR)` of the corresponding F-test |
+
+The `full` timepoint gets its own *t* contrast but is deliberately **excluded from the
+F-tests**: it is a media control, not a stimulation timepoint, so including it would let a site
+qualify as "responsive" purely because full media differs from starve. Because `full` is a
+single shared channel per plex, its contrast is emitted once, under the first condition name
+(`WT_log2:pvalue_EGF_full`), rather than duplicated under all three arms.
+
+## `limmaFC` and the existing `log2:FC` agree exactly
+
+Worth recording, because it is easy to mistake for a bug: `WT_log2:limmaFC_EGF_5` comes out
+**numerically identical** to the pipeline's `WT_log2:FC_EGF_5` (maximum difference 7e-15 on
+`hme1_2`, at every value of `n:reps`, not only on complete sites).
+
+That is the correct result rather than a coincidence. Because missingness is plex-wise, the
+plexes a site is observed in always contribute a *complete and balanced* set of channels, and
+for a balanced blocked design the fitted group difference reduces exactly to the mean of the
+per-plex differences — which is what the Python `compute_fold_change` already computed.
+
+So limma does not change the fold-change point estimate here. **What it adds is the variance
+model**: the moderated *t* and *F* statistics, their p-values and the FDR — the part that
+4 replicates cannot estimate reliably on their own. The `limmaFC` column is kept anyway so the
+output file stands alone: each p-value ships with the effect size it refers to.
+
+```{r session-info}
+sessionInfo()
+```
