@@ -119,7 +119,7 @@ def add_modification_metadata(
     site_start_col: str = "site_start",
     site_end_col: str = "site_end",
     protein_id_col: str = "protein_Id",
-) -> pd.DataFrame:
+) -> pd.DataFrame: # Valid only for the LFQ test datafrae
     """
     Add modification metadata and a composite site identifier column to the DataFrame.
 

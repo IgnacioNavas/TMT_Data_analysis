@@ -206,6 +206,88 @@ def filter_incomplete_timeseries(
     return df.loc[n_missing <= max_missing].copy()
 
 
+def filter_by_ffdr(df: pd.DataFrame,
+                   cell_lines: list,
+                   conditions: list,
+                   max_ffdr: float = 0.05,
+                   omnibus_type: str = "log2:FFDR",
+                   combine: str = "any",
+                   verbose: bool = False,
+                   ) -> pd.DataFrame:
+    """
+    Keep the sites limma's omnibus F-test calls responsive.
+
+    The omnibus F, computed in `notebooks/01_preprocessing/limma_for_pvalues.rmd` and merged
+    onto the processed tables, tests one condition's timepoint contrasts *jointly* against
+    starve: H0 is that the whole time course is flat. It is one test per site per condition,
+    so the FDR needs no further correction across timepoints.
+
+    This is the reproducibility criterion `filter_dynamics` cannot give. An amplitude cutoff
+    asks only "did this site move"; the F-test asks "did it move more than its own replicate
+    noise", which is a different question and keeps different sites — a 0.6 log2FC seen once
+    is not the evidence a 0.6 log2FC seen in four plexes is.
+
+    Columns are built from the project naming convention as
+    `{cell_line}_{omnibus_type}_{condition}_omnibus`, e.g. `WT_log2:FFDR_EGF_omnibus`
+    (`ColumnSpec.select` is not used here: the omnibus columns carry the literal timepoint
+    field 'omnibus' rather than a real timepoint, so there is nothing to select over).
+    Passing `conditions=["_ALL_"]` resolves to `{cell_line}_log2:FFDR_ALL_omnibus`, the single
+    F over every stimulation contrast of every condition — the stricter alternative to OR-ing
+    the per-condition tests when several conditions are clustered jointly.
+
+    ⚠ Sites limma did not test (detected in too few plexes) carry NaN and are always dropped,
+    since `NaN < max_ffdr` is False. This is only true if the statistics columns really are
+    NaN: a `.fillna(0)` applied to the whole DataFrame on load turns an untested site into
+    FFDR = 0.0, i.e. perfectly significant, and every untested site then survives this filter.
+    Fill the data columns only.
+
+    Args:
+        df: DataFrame with the merged limma omnibus columns.
+        cell_lines: list of cell-line prefixes, e.g. ["WT"].
+        conditions: list of condition substrings, e.g. ["_EGF_", "_INS_"]; surrounding
+            underscores are optional. Use ["_ALL_"] for the joint omnibus column.
+        max_ffdr: FDR cutoff; None returns the DataFrame unfiltered, so a notebook can switch
+            the step off by setting its parameter to None without an `if` around the call.
+        omnibus_type: data type of the omnibus FDR columns (default "log2:FFDR"). Use
+            "log2:Fpvalue" to cut on the raw p-value instead of the corrected one.
+        combine: 'any' keeps a site responding in at least one of the requested conditions
+            (the union — what you want when clustering several conditions together);
+            'all' keeps only sites responding in every one of them.
+        verbose: print how many sites were kept, dropped, and never tested.
+
+    Returns:
+        Filtered DataFrame copy.
+
+    """
+    if max_ffdr is None:
+        return df.copy()
+
+    if combine not in ("any", "all",):
+        raise ValueError(f"combine must be 'any' or 'all', got {combine!r}")
+
+    cols = [f"{cell_line}_{omnibus_type}_{condition.strip('_')}_omnibus"
+            for cell_line in cell_lines
+            for condition in conditions]
+
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        present = [c for c in df.columns if "omnibus" in c]
+        raise KeyError(f"limma omnibus columns not found in the dataset: {missing}. "
+                       f"Omnibus columns present: {present}. Run limma_for_pvalues.rmd and "
+                       f"the merge cell in TMT_dataset_preprocessing.ipynb.")
+
+    significant = df[cols] < max_ffdr
+    mask = significant.any(axis=1,) if combine == "any" else significant.all(axis=1,)
+
+    if verbose:
+        n_untested = int(df[cols].isna().all(axis=1,).sum(),)
+        print(f"FFDR < {max_ffdr} ({combine} of {', '.join(cols)}): "
+              f"{int(mask.sum(),)} of {len(df,)} sites kept "
+              f"({int((~mask).sum(),)} dropped, of which {n_untested} never tested by limma)")
+
+    return df.loc[mask].copy()
+
+
 def filter_by_localization(
     df: pd.DataFrame,
     min_localized: int = 1,

@@ -1,0 +1,1290 @@
+---
+title: "Trendy — segmented-regression patterns of each phosphosite time course"
+output: html_notebook
+---
+
+# Purpose
+
+For **one stimulation condition** (EGF by default), describe the shape of every phosphosite's time
+course as a sequence of **linear segments** joined at **breakpoints**, using the Bioconductor
+package [**Trendy**](https://bioconductor.org/packages/Trendy/) (Bacher *et al.* 2018,
+*BMC Bioinformatics* 19:380).
+
+The `full` timepoint is **excluded** — it is a media control, not a point on the post-stimulation
+clock. `starve` is kept as time zero, because it is the state the cells are in when EGF is added.
+
+The output is one row per site carrying a **pattern string** (`up-down`, `up-flat`, `flat`, …), the
+fitted breakpoint times in minutes, the slope and significance of each segment, and the adjusted
+R² of the fit.
+
+## What this adds to what the project already has
+
+| approach | where | what it gives | what it assumes |
+|---|---|---|---|
+| model-free descriptors | `src/response_shapes.py` | peak time, retention, AUC — read off the grid | nothing, but the timing is **quantised** to the sampled timepoints |
+| shape census | `src/response_shapes.py` | one of six classes per site (`transient`, `sustained`, …) | a noise band; classes are rule-based, not fitted |
+| anchored sigmoid | `src/curve_fitting.py`, `notebooks/06_sigmoids/` | continuous T50 and amplitude | a **monotone** S-shape — structurally excludes the transient majority |
+| **Trendy (this file)** | here | a fitted **piecewise-linear** shape: how many turning points, when, and in which direction | linearity within each segment; enough samples per segment |
+
+Trendy fills the specific gap the sigmoid work left open: it is the first method here that can
+**fit** a rise-and-fall — the 69% of EGF-responsive sites that `clustering_method_decision.md` §9.5
+recorded as transient or biphasic, and that a logistic cannot represent. It does it without
+committing to a parametric peak shape, by letting a breakpoint mark the turn.
+
+It is *not* a replacement for the sigmoid fits. A segmented fit gives a **turning time**; the
+sigmoid gives a **half-response time**. Those are different quantities and both are useful.
+
+# What Trendy actually does
+
+## Segmented (breakpoint) regression
+
+Ordinary linear regression fits one straight line, $y = a + bt$, through all the points.
+**Segmented regression** fits several straight lines joined end to end:
+
+```
+     y                          .-----------      segment 3: slope ~ 0  ("flat")
+       |                     .-'
+       |                  .-'                     segment 2: slope > 0  ("up")
+       |    .------------'
+       |  -'                                      segment 1: slope > 0
+       +------------------------------------ t
+              ^            ^
+          breakpoint 1  breakpoint 2
+```
+
+- a **breakpoint** (also *changepoint*, and `psi` in the underlying `segmented` package) is a time
+  at which the slope changes. It is **fitted**, not chosen from the sampling grid, so it can land
+  between two sampled timepoints;
+- a **segment** is the stretch between two consecutive breakpoints;
+- each segment has a **slope** and a p-value for that slope, and Trendy converts the pair into a
+  **trend**: `1` = up, `-1` = down, `0` = no change (slope not significant at `pvalCut`);
+- the sequence of trends is the site's **pattern** — the thing this notebook is for.
+
+The fit is continuous: the segments join at the breakpoints rather than jumping. So a transient
+response is `up` then `down`, and the breakpoint between them is an estimate of **when the site
+turned over**, which no method currently in this project produces.
+
+## How Trendy chooses the number of breakpoints
+
+For each site it fits every model from 0 breakpoints (plain linear regression) up to `maxK`, and
+picks between them with the **BIC** (Bayesian Information Criterion):
+
+$$\mathrm{BIC} = -2\log L + p\log n$$
+
+— misfit plus a penalty for the number of parameters $p$, so a breakpoint has to earn its keep.
+Lower is better. Two rules then override the BIC choice (they are in `fitSegBIC`, and both matter
+on a design this small):
+
+1. every segment must contain at least `minNumInSeg` **samples**, otherwise the number of
+   breakpoints is reduced until it does;
+2. no breakpoint may fall before the `minNumInSeg`-th sample;
+3. if the best breakpoint model still does not beat plain linear regression on BIC, the linear fit
+   is returned with `Breakpoints = NA`.
+
+So "no breakpoints" is a real, reachable answer, not a failure.
+
+## ⚠️ How a segment is called `up`, `down` or `flat` — and why the test is unusually strict
+
+A **p-value** is: if this segment's slope were really zero, how often would noise alone produce a
+slope at least this steep? Small p = hard to explain as noise. Trendy takes the slope's *t*
+statistic (slope divided by its standard error) and converts it with
+
+```r
+slp.pval <- pt(-abs(slp.t), 1)        # fitSegBIC(), Trendy source
+```
+
+— a one-sided tail of a *t* distribution with **1 degree of freedom**, hard-coded, not the residual
+df of the fit (which is ~20 here). A *t* on 1 df is the Cauchy distribution: extremely heavy tails,
+so it demands a much larger statistic before it yields a small p. At the default `pvalCut = 0.1` a
+segment needs $|t| > 3.08$ to be called `up` or `down`, where the same one-sided test on the fit's
+actual 20 df would need only $|t| > 1.33$.
+
+Two consequences to carry into the census:
+
+- `pvalCut = 0.1` here is **not** a 10% test in the usual sense. It is deliberately conservative,
+  which is presumably why the package default is 0.1 rather than 0.05. Do not "correct" it to 0.05
+  on the reflex that 0.05 is standard — that makes an already strict test stricter.
+- **`flat` is a conservative call**, so the flat fraction below is an *upper* bound on the number of
+  genuinely non-responding sites. The limma FFDR column, which uses a properly moderated variance
+  with the right df, is the better authority on responsiveness, and it is carried into the output
+  so the two can be compared directly.
+
+## Adjusted R²
+
+$R^2$ is the fraction of the variance in the data explained by the fit. **Adjusted** $R^2$ subtracts
+a penalty for the number of parameters, so it does not automatically rise when a segment is added.
+`topTrendy(adjR2Cut = ...)` uses it as the quality filter, exactly as `fit_ok` gates the sigmoid
+fits. It is a *fit-quality* measure, not a shape test: a large clean response scores well even if the
+segmentation is arguable.
+
+# ⚠️ What this design can and cannot support
+
+**Read this before trusting a pattern.** Trendy was written for ordered profiling experiments with
+many time levels — the package vignette uses tens of points. This dataset has **six**
+(`starve`, 2, 5, 10, 15, 90 min), and no fitter creates information that the design did not collect.
+
+## The degrees-of-freedom ledger
+
+Per site, per condition: 6 timepoints × 4 replicates = **24 samples**, 6 distinct **time levels**.
+
+| model | free parameters | samples | residual df |
+|---|---|---|---|
+| linear (0 breakpoints) | 2 | 24 | 22 |
+| 1 breakpoint | 4 (2 slopes, intercept, breakpoint) | 24 | 20 |
+| 2 breakpoints | 6 | 24 | 18 |
+
+Those residual df look comfortable, and they are **misleading in exactly the way
+`council_note_3_temporal_curve_modelling.md` documented for the impulse model**: replicates buy
+*pure-error* df, not *lack-of-fit* df. The number that limits what shape can be resolved is the
+count of distinct **time levels**, which is 6. Three segments need six time levels at two apiece —
+i.e. `maxK = 2` is the arithmetic ceiling and leaves nothing over to check the shape with.
+
+`MAX_K` is therefore capped at 2 here and defaults to **2**, and a 2-breakpoint call should be
+treated as descriptive rather than established. The same reasoning is why `minNumInSeg = 5`: with
+4 replicates per timepoint, requiring 5 samples per segment forces **at least two distinct
+timepoints** into every segment. Lowering it to 4 would let a segment be fitted through a single
+timepoint's replicates — a slope estimated from four measurements taken at the same time, which is
+not a slope.
+
+## Trendy refuses missing values
+
+`trendy()` stops on the first `NA`. TMT missingness is plex-wise, so the workable filter is
+`n:reps == 4` — sites quantified in all four plexes — which is applied below and reported. Sites
+with 2–3 plexes are **not** analysable by this method at all; they are absent from the output, and
+that absence is not evidence about their behaviour.
+
+## The time axis, and why the default is not minutes
+
+Trendy fits *straight lines in whatever units `tVectIn` carries*, so the axis is a modelling choice
+with consequences:
+
+| axis | breakpoints reported in | problem |
+|---|---|---|
+| `minutes` | minutes directly | the grid is log-spaced, so the 90-min point carries leverage 0.979 (`clustering_method_decision.md`) and one measurement dominates every segment reaching it |
+| `log` = $\log_{10}(t+1)$ | log units, back-transformed | Trendy's internal starting values are `round()`ed to integers (`breakpointFit`), and this axis spans only 0–1.96, so every starting guess collapses onto 0/1/2 |
+| **`index`** (default) | timepoint index 1–6, interpolated back to minutes | none of the above; the spacing is uniform |
+
+`index` is the default because uniform spacing on this particular grid is **near-identical to
+log-time weighting** — `clustering_method_decision.md` measured $r = 0.987$ between the two,
+because `{0, 2, 5, 10, 15, 90}` is already approximately log-spaced. It also matches how Trendy was
+designed to be used ("ordered conditions"), and keeps the integer starting values sensible.
+
+Breakpoints come back on the index axis and are converted to minutes by interpolating between the
+flanking timepoints (`BREAKPOINT_INTERP`, in log-minute space by default, consistent with the axis
+choice). Both are reported, so nothing is hidden behind the conversion.
+
+## Two further caveats
+
+- **No between-sample normalisation upstream.** The pipeline applies none (CLAUDE.md → Known
+  issues; `NORMALIZE <- "none"` in `limma_for_pvalues.rmd`). Since Trendy fits each site
+  separately, a *site-constant* offset is harmless — it is absorbed by the intercept. What is not
+  harmless is a **per-channel** offset, which enters as slope-distorting noise. `NORMALIZE` and
+  `PLEX_CENTER` below both address it and are reported side by side.
+- **Trendy has no blocking term.** `limma_for_pvalues.rmd` fits `~ 0 + group + plex` because each
+  replicate is one TMT plex with its own offset. Trendy cannot express that, so `PLEX_CENTER`
+  removes the per-plex offset from each site before fitting. This is the segmented-regression
+  equivalent of limma's `plex` term and it costs 3 df per site (four plex means constrained to the
+  site mean).
+
+# Installation
+
+Trendy is **not** installed in the environment this file was written against (R 4.6.1). Install it
+once, then re-run:
+
+```{r install-trendy, eval=FALSE}
+# Run once, interactively. Not evaluated when the notebook is knitted.
+# if (!requireNamespace("BiocManager", quietly = TRUE)) {
+#   install.packages("BiocManager")
+# }
+# BiocManager::install("Trendy")
+```
+
+# Parameters
+
+Paths are resolved from the **project root**, located by walking up from the working directory,
+exactly as in `limma_for_pvalues.rmd` — knitting runs with this file's folder as the working
+directory while the IDE console runs from the project root, and no single relative path serves
+both.
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Trendy)
+})
+
+find_project_root <- function(start = getwd(),
+                              markers = c("data", "src", "notebooks")) {
+  # Locate the project root by walking up the directory tree from `start`.
+  #
+  # Args:
+  #   start: directory to start searching from, default the current working directory.
+  #   markers: directory names that must all be present for a folder to count as the root.
+  #
+  # Returns:
+  #   Absolute path to the project root. Raises an error if no ancestor directory qualifies.
+
+  path <- normalizePath(start, mustWork = TRUE)
+
+  repeat {
+    if (all(dir.exists(file.path(path, markers)))) {
+      return(path)
+    }
+    parent <- dirname(path)
+    if (identical(parent, path)) {
+      stop("find_project_root: no ancestor of '", start, "' contains all of: ",
+           paste(markers, collapse = ", "),
+           ". Set PROJECT_ROOT manually to the TMT_Data_analysis folder.")
+    }
+    path <- parent
+  }
+}
+
+PROJECT_ROOT <- find_project_root()
+DATA_DIR     <- file.path(PROJECT_ROOT, "Experiment")
+PROCESSED_SUBDIR <- file.path("Data", "Processed")
+
+# ── What to analyse ─────────────────────────────────────────────────────────────────────
+DATASET   <- "hme1_2"      # dataset key = folder name under Experiment/
+CELL_LINE <- "WT"
+CONDITION <- "EGF"         # ONE condition per run; rerun for INS / EGFnINS and compare
+CONTROL   <- "starve"      # kept as t = 0
+EXCLUDE   <- "full"        # media control — never a point on the post-stimulation clock
+
+# Candidate input files, tried in order. The first that exists and carries the required
+# log2:abs columns is used, so the notebook survives the processed file being renamed.
+INPUT_CANDIDATES <- c("20260807_hTERT_HEM1_2_processed_phPlus.tsv",
+                      "20260807_hTERT_HEM1_2_log2_processed.tsv")
+
+# ── Which sites are eligible ────────────────────────────────────────────────────────────
+REQUIRE_COMPLETE <- TRUE   # Trendy cannot accept NA — see the caveats above
+MIN_REPS         <- 4      # n:reps; must be the full plex count while REQUIRE_COMPLETE is TRUE
+USE_FFDR         <- TRUE   # restrict to limma-responsive sites (much faster, and interpretable)
+MAX_FFDR         <- 0.05   # BH-FDR of the omnibus F-test for this condition
+
+# ── Pre-processing applied before fitting ───────────────────────────────────────────────
+NORMALIZE   <- "none"      # "none" | "median" — between-sample (column) centring
+PLEX_CENTER <- TRUE        # remove each replicate's per-site offset (limma's `plex` term)
+
+# ── The Trendy fit ──────────────────────────────────────────────────────────────────────
+TIME_AXIS          <- "index"   # "index" | "minutes" | "log"  — see the caveats above
+BREAKPOINT_INTERP  <- "log"     # "log" | "linear" — how an index breakpoint becomes minutes
+MAX_K              <- 2         # maximum breakpoints. 2 is the arithmetic ceiling here
+MIN_NUM_IN_SEG     <- 5         # samples per segment; 5 forces >= 2 distinct timepoints
+PVAL_CUT           <- 0.10      # slope p-value below which a segment counts as up/down
+NUM_TRY            <- 5         # optimiser restarts inside `segmented`
+MEAN_CUT           <- -Inf      # Trendy's own low-expression filter; disabled, we filter ourselves
+ADJ_R2_CUT         <- 0.50      # quality gate, applied as a flag rather than as a hard filter
+NCORES             <- 1         # 1 = reproducible (see the note on jitter below)
+SEED               <- 1
+
+# ── Output ──────────────────────────────────────────────────────────────────────────────
+OUT_SUFFIX   <- paste0("_trendy_", CONDITION, "_patterns.tsv")
+SAVE_TABLE   <- TRUE
+SAVE_FIGURES <- FALSE
+
+# ── Debugging ───────────────────────────────────────────────────────────────────────────
+MAX_SITES <- Inf   # e.g. 500 to smoke-test the whole file in seconds
+VERBOSE   <- TRUE
+
+cat("Trendy version   :", as.character(packageVersion("Trendy")), "\n")
+cat("segmented version:", as.character(packageVersion("segmented")), "\n")
+cat("project root     :", PROJECT_ROOT, "\n")
+```
+
+## Resolving the input file
+
+```{r resolve-input}
+resolve_input_file <- function(dataset,
+                               candidates,
+                               data_dir = DATA_DIR,
+                               subdir = PROCESSED_SUBDIR) {
+  # Pick the first candidate processed file that exists for this dataset.
+  #
+  # Args:
+  #   dataset: dataset key, e.g. "hme1_2"; also the folder name under Experiment/.
+  #   candidates: character vector of file names to try, in priority order.
+  #   data_dir: the Experiment/ directory.
+  #   subdir: path of the processed folder inside the dataset folder.
+  #
+  # Returns:
+  #   Absolute path to the first existing candidate. Raises listing the folder if none exists.
+
+  folder <- file.path(data_dir, dataset, subdir)
+  if (!dir.exists(folder)) {
+    stop("resolve_input_file: '", folder, "' does not exist.")
+  }
+
+  for (candidate in candidates) {
+    path <- file.path(folder, candidate)
+    if (file.exists(path)) {
+      return(path)
+    }
+  }
+
+  stop("resolve_input_file: none of the candidates exist in '", folder, "'.\n",
+       "  tried   : ", paste(candidates, collapse = ", "), "\n",
+       "  present : ", paste(list.files(folder, pattern = "\\.tsv$"), collapse = ", "))
+}
+
+
+trendy_output_path <- function(input_path,
+                               out_suffix = OUT_SUFFIX) {
+  # Build the output path next to the input, reusing the input's date-prefixed stem.
+  #
+  # Args:
+  #   input_path: path of the processed .tsv that was read.
+  #   out_suffix: suffix appended to the stem, including the extension.
+  #
+  # Returns:
+  #   Absolute path of the .tsv to write. Raises if it would collide with the input.
+
+  stem <- basename(input_path)
+  stem <- sub("_processed_phPlus\\.tsv$", "", stem)
+  stem <- sub("_log2_processed\\.tsv$", "", stem)
+  stem <- sub("\\.tsv$", "", stem)
+
+  output_path <- file.path(dirname(input_path), paste0(stem, out_suffix))
+  if (identical(output_path, input_path)) {
+    stop("trendy_output_path: refusing to overwrite the input file '", input_path, "'.")
+  }
+  output_path
+}
+
+INPUT_FILE  <- resolve_input_file(DATASET, INPUT_CANDIDATES)
+OUTPUT_FILE <- trendy_output_path(INPUT_FILE)
+
+cat("input : ", INPUT_FILE, "\n")
+cat("output: ", OUTPUT_FILE, "\n")
+```
+
+# Progress checkpoints
+
+Same pattern as `limma_for_pvalues.rmd`: every stage announces itself **before** it runs, so a run
+that stalls leaves the name of the stage it is stuck in as the last line printed. Trendy is the
+slow part of this notebook — it fits `MAX_K + 1` regression models per site — so knowing which
+stage is running matters.
+
+```{r checkpoints}
+.timing <- new.env(parent = emptyenv())
+
+stage <- function(label,
+                  expr) {
+  # Run one stage, announcing it before evaluation and timing it after.
+  #
+  # `expr` is passed unevaluated and forced inside, so the "starting" line is printed and flushed
+  # before any work begins.
+  #
+  # Args:
+  #   label: short description of the stage.
+  #   expr: the expression to evaluate.
+  #
+  # Returns:
+  #   The value of `expr`.
+
+  if (VERBOSE) {
+    cat(sprintf("[%s]   -> %-46s ", format(Sys.time(), "%H:%M:%S"), paste0(label, " ...")))
+    flush.console()
+  }
+
+  started <- proc.time()[["elapsed"]]
+  value   <- force(expr)
+  elapsed <- proc.time()[["elapsed"]] - started
+
+  if (VERBOSE) {
+    cat(sprintf("done in %7.1fs\n", elapsed))
+    flush.console()
+  }
+  value
+}
+```
+
+# Functions
+
+```{r functions}
+sort_timepoints <- function(timepoints,
+                            control = CONTROL) {
+  # Order timepoint labels biologically: the control first, then the numeric points ascending.
+  #
+  # Args:
+  #   timepoints: character vector of timepoint labels, e.g. c("10", "2", "starve").
+  #   control: label of the control timepoint, placed first.
+  #
+  # Returns:
+  #   The labels in plotting / fitting order.
+
+  numeric_points <- setdiff(timepoints, control)
+  c(control[control %in% timepoints],
+    numeric_points[order(as.numeric(numeric_points))])
+}
+
+
+timepoint_minutes <- function(labels,
+                              control = CONTROL) {
+  # Translate timepoint labels into minutes, with the control at 0.
+  #
+  # Args:
+  #   labels: character vector of timepoint labels.
+  #   control: label mapped to 0.
+  #
+  # Returns:
+  #   Numeric vector of minutes, same length and order as `labels`.
+
+  minutes <- suppressWarnings(as.numeric(labels))
+  minutes[labels == control] <- 0
+  if (anyNA(minutes)) {
+    stop("timepoint_minutes: cannot convert to minutes: ",
+         paste(labels[is.na(minutes)], collapse = ", "))
+  }
+  minutes
+}
+
+
+parse_condition_columns <- function(column_names,
+                                    cell_line = CELL_LINE,
+                                    condition = CONDITION,
+                                    exclude = EXCLUDE,
+                                    control = CONTROL) {
+  # Find and parse the log2:abs replicate columns of one cell line and condition.
+  #
+  # The `full` timepoint is dropped here rather than downstream, so nothing later has to remember
+  # to exclude it. Columns are returned sorted onto the minute axis (control first) — the on-disk
+  # order is not trusted, because Trendy assumes `tVectIn` is ascending.
+  #
+  # Args:
+  #   column_names: all column names of the dataset.
+  #   cell_line: cell line prefix, e.g. "WT".
+  #   condition: single condition name, e.g. "EGF".
+  #   exclude: timepoint label to drop entirely, e.g. "full".
+  #   control: timepoint label kept as t = 0.
+  #
+  # Returns:
+  #   data.frame with one row per sample column, ordered by time then replicate, and the columns
+  #   `column`, `timepoint`, `plex`, `minutes`.
+
+  pattern <- paste0("^", cell_line, "_log2:abs_", condition, "_([^_]+)_(r[0-9]+)$")
+  matched <- grep(pattern, column_names, value = TRUE)
+  if (length(matched) == 0) {
+    stop("parse_condition_columns: no log2:abs columns matched '", pattern, "'.")
+  }
+
+  fields <- regmatches(matched, regexec(pattern, matched))
+  info <- data.frame(column    = matched,
+                     timepoint = vapply(fields, `[`, character(1), 2),
+                     plex      = vapply(fields, `[`, character(1), 3),
+                     stringsAsFactors = FALSE)
+
+  info <- info[!info$timepoint %in% exclude, , drop = FALSE]
+  info$minutes <- timepoint_minutes(info$timepoint, control)
+  info <- info[order(info$minutes, info$plex), , drop = FALSE]
+  rownames(info) <- NULL
+  info
+}
+
+
+normalize_matrix <- function(M,
+                             method) {
+  # Apply between-sample (column) normalisation to the log2 matrix.
+  #
+  # Args:
+  #   M: numeric matrix, sites in rows and samples in columns, on the log2 scale.
+  #   method: "none" (unchanged) or "median" (centre every column on the grand median).
+  #
+  # Returns:
+  #   The normalised matrix, same dimensions and dimnames.
+
+  if (method == "none") {
+    return(M)
+  }
+  if (method == "median") {
+    column_medians <- apply(M, 2, median, na.rm = TRUE)
+    return(sweep(M, 2, column_medians) + mean(column_medians))
+  }
+  stop("normalize_matrix: unknown method '", method, "'.")
+}
+
+
+center_plex <- function(M,
+                        plex) {
+  # Remove each replicate's per-site offset — the segmented-regression stand-in for limma's
+  # `plex` blocking term.
+  #
+  # Each TMT plex has its own overall intensity offset. limma absorbs it with a `plex` factor;
+  # Trendy has no blocking term, so a plex that ran 0.4 log2 units high adds a step to the
+  # residuals of every site and flattens real slopes. For each site and plex the mean over that
+  # plex's timepoints is subtracted and the site's grand mean added back, so the level of each
+  # site is preserved while the between-plex offsets are removed.
+  #
+  # Costs 3 degrees of freedom per site (four plex means constrained to the site mean); with 24
+  # samples that is affordable, and it is reported in the output as `plex_centered`.
+  #
+  # Args:
+  #   M: numeric matrix, sites in rows, samples in columns, no NA.
+  #   plex: character or factor vector giving the plex of each column of M.
+  #
+  # Returns:
+  #   The centred matrix, same dimensions and dimnames.
+
+  plex <- as.character(plex)
+  grand <- rowMeans(M)
+  out <- M
+
+  for (level in unique(plex)) {
+    columns <- which(plex == level)
+    offset  <- rowMeans(M[, columns, drop = FALSE]) - grand
+    out[, columns] <- M[, columns, drop = FALSE] - offset
+  }
+  out
+}
+
+
+build_time_vector <- function(sample_info,
+                              axis = TIME_AXIS) {
+  # Build the numeric time vector Trendy fits against, on the requested axis.
+  #
+  # Args:
+  #   sample_info: data.frame from parse_condition_columns(), already time-ordered.
+  #   axis: "index" (1..T by timepoint order), "minutes" (raw), or "log" (log10(minutes + 1)).
+  #
+  # Returns:
+  #   Named numeric vector, one entry per sample column, names = column names.
+
+  minutes_levels <- sort(unique(sample_info$minutes))
+
+  values <- switch(axis,
+                   index   = match(sample_info$minutes, minutes_levels),
+                   minutes = sample_info$minutes,
+                   log     = log10(sample_info$minutes + 1),
+                   stop("build_time_vector: unknown axis '", axis, "'."))
+
+  values <- as.numeric(values)
+  names(values) <- sample_info$column
+  values
+}
+
+
+axis_to_minutes <- function(x,
+                            minutes_levels,
+                            axis = TIME_AXIS,
+                            interp = BREAKPOINT_INTERP) {
+  # Convert a fitted breakpoint from the fitting axis back to minutes.
+  #
+  # On the "index" axis a breakpoint at, say, 3.4 sits 40% of the way from the 3rd to the 4th
+  # timepoint. "40% of the way" needs a scale: `interp = "log"` interpolates in log10(t + 1),
+  # which is consistent with the reason the index axis was chosen (uniform index spacing is
+  # near-equivalent to log-time on this grid), while "linear" interpolates in raw minutes and
+  # will place the same breakpoint much later.
+  #
+  # Args:
+  #   x: numeric vector of breakpoints on the fitting axis (may contain NA).
+  #   minutes_levels: sorted unique timepoints in minutes, e.g. c(0, 2, 5, 10, 15, 90).
+  #   axis: the axis the fit used.
+  #   interp: "log" or "linear", used only for the "index" axis.
+  #
+  # Returns:
+  #   Numeric vector of breakpoint times in minutes, same length as x.
+
+  if (axis == "minutes") {
+    return(x)
+  }
+  if (axis == "log") {
+    return(10 ^ x - 1)
+  }
+  if (axis != "index") {
+    stop("axis_to_minutes: unknown axis '", axis, "'.")
+  }
+
+  index_levels <- seq_along(minutes_levels)
+  if (interp == "linear") {
+    return(approx(index_levels, minutes_levels, xout = x, rule = 2)$y)
+  }
+  if (interp == "log") {
+    logged <- approx(index_levels, log10(minutes_levels + 1), xout = x, rule = 2)$y
+    return(10 ^ logged - 1)
+  }
+  stop("axis_to_minutes: unknown interp '", interp, "'.")
+}
+
+
+trend_labels <- function(trends) {
+  # Translate Trendy's numeric trend codes into words.
+  #
+  # Args:
+  #   trends: numeric vector of -1 / 0 / 1, possibly padded with NA.
+  #
+  # Returns:
+  #   Character vector of "down" / "flat" / "up", with NA preserved.
+
+  out <- rep(NA_character_, length(trends))
+  out[which(trends ==  1)] <- "up"
+  out[which(trends == -1)] <- "down"
+  out[which(trends ==  0)] <- "flat"
+  out
+}
+
+
+trendy_result_table <- function(fit_list,
+                                minutes_levels,
+                                max_k = MAX_K,
+                                adj_r2_cut = ADJ_R2_CUT) {
+  # Flatten Trendy's per-site list into one tidy row per fitted site.
+  #
+  # Built from the raw fit list rather than from topTrendy() on purpose: topTrendy drops every
+  # site below the adjusted-R2 cutoff, and a dropped site is not the same thing as a site with no
+  # pattern. Here every fitted site gets a row and the cutoff becomes a flag, matching how the
+  # sigmoid notebook reports `fit_ok` alongside the sites it excludes.
+  #
+  # Args:
+  #   fit_list: the list returned by results(trendy(...)), one element per site.
+  #   minutes_levels: sorted unique timepoints in minutes, for the breakpoint conversion.
+  #   max_k: maximum number of breakpoints, fixing the width of the output table.
+  #   adj_r2_cut: adjusted-R2 threshold recorded in `r2_ok`.
+  #
+  # Returns:
+  #   data.frame with one row per site: identity, pattern, breakpoints (axis units and minutes),
+  #   per-segment slopes / trends / p-values, adjusted R2 and quality flags.
+
+  n_seg_max <- max_k + 1
+
+  rows <- lapply(names(fit_list), function(site) {
+    fit <- fit_list[[site]]
+
+    trends <- as.numeric(fit$Segment.Trends)
+    slopes <- as.numeric(fit$Segment.Slopes)
+    pvals  <- as.numeric(fit$Segment.Pvalues)
+
+    breaks <- fit$Breakpoints
+    breaks <- if (all(is.na(breaks))) numeric(0) else as.numeric(breaks[!is.na(breaks)])
+
+    words <- trend_labels(trends)
+    row <- data.frame(site           = site,
+                      n_segments     = length(trends),
+                      n_breakpoints  = length(breaks),
+                      pattern        = paste(words, collapse = "-"),
+                      first_trend    = words[1],
+                      last_trend     = words[length(words)],
+                      responsive     = any(trends != 0),
+                      adj_r2         = as.numeric(fit$AdjustedR2),
+                      stringsAsFactors = FALSE)
+
+    # Fixed-width columns, padded with NA, so every site has the same schema regardless of how
+    # many segments its own fit ended up with.
+    for (i in seq_len(n_seg_max)) {
+      row[[paste0("segment", i, "_slope")]]  <- if (i <= length(slopes)) slopes[i] else NA_real_
+      row[[paste0("segment", i, "_trend")]]  <- if (i <= length(words))  words[i]  else NA_character_
+      row[[paste0("segment", i, "_pvalue")]] <- if (i <= length(pvals))  pvals[i]  else NA_real_
+    }
+    for (i in seq_len(max_k)) {
+      value <- if (i <= length(breaks)) breaks[i] else NA_real_
+      row[[paste0("breakpoint", i, "_axis")]] <- value
+      row[[paste0("breakpoint", i, "_min")]]  <- axis_to_minutes(value, minutes_levels)
+    }
+    row
+  })
+
+  out <- do.call(rbind, rows)
+  out$r2_ok      <- out$adj_r2 >= adj_r2_cut
+  out$pattern_ok <- out$r2_ok & out$responsive
+  rownames(out) <- NULL
+  out
+}
+
+
+pattern_census <- function(patterns,
+                           groups = NULL) {
+  # Tabulate how many sites follow each pattern, and what fraction that is.
+  #
+  # The direct analogue of `shape_census` in src/response_shapes.py, so the two summaries can be
+  # read side by side.
+  #
+  # Args:
+  #   patterns: character vector of pattern strings, one per site.
+  #   groups: optional named list of logical vectors defining subsets to report separately.
+  #
+  # Returns:
+  #   data.frame with one row per pattern: counts and percentages, most frequent first.
+
+  counts <- sort(table(patterns), decreasing = TRUE)
+  out <- data.frame(pattern = names(counts),
+                    n       = as.integer(counts),
+                    pct     = round(100 * as.integer(counts) / length(patterns), 1),
+                    stringsAsFactors = FALSE)
+
+  if (!is.null(groups)) {
+    for (group_name in names(groups)) {
+      subset_counts <- table(patterns[groups[[group_name]]])
+      out[[paste0("n_", group_name)]] <- as.integer(subset_counts[out$pattern])
+      out[[paste0("pct_", group_name)]] <-
+        round(100 * as.integer(subset_counts[out$pattern]) / sum(groups[[group_name]]), 1)
+    }
+  }
+  out[is.na(out)] <- 0
+ # out
+}
+```
+
+# Sanity checks
+
+Five checks on synthetic data with a known answer, before any real site is fitted. Each one would
+fail loudly if a wiring assumption were wrong, and together they are the reason the patterns below
+can be believed. **Synthetic data** = a curve whose true shape is known, plus realistic noise;
+recovering the known answer is the only way to test an estimator, since real data has no known
+answer.
+
+```{r sanity-checks}
+set.seed(SEED)
+
+# The design this notebook actually fits: 6 timepoints x 4 replicates, on the index axis.
+.minutes_levels <- c(0, 2, 5, 10, 15, 90)
+.n_rep          <- 4
+.sample_minutes <- rep(.minutes_levels, each = .n_rep)
+.tvect          <- rep(seq_along(.minutes_levels), each = .n_rep)
+names(.tvect)   <- paste0("s", seq_along(.tvect))
+.sigma          <- 0.184   # measured across-replicate SD in hme1_2
+
+# 1. The axis conversion is an exact round trip on the sampled timepoints themselves.
+stopifnot(all.equal(axis_to_minutes(seq_along(.minutes_levels), .minutes_levels, "index", "log"),
+                    .minutes_levels))
+cat("axis round trip  : index i -> minutes[i], exactly\n")
+
+# 2. A breakpoint between two timepoints lands between them, and the two interpolations differ
+#    in the direction the caveat above predicts (log earlier than linear).
+.log_mid    <- axis_to_minutes(4.5, .minutes_levels, "index", "log")
+.linear_mid <- axis_to_minutes(4.5, .minutes_levels, "index", "linear")
+stopifnot(.log_mid > 10, .log_mid < 15, .linear_mid > 10, .linear_mid < 15,
+          .log_mid < .linear_mid)
+cat(sprintf("interpolation    : index 4.5 -> %.2f min (log) vs %.2f min (linear)\n",
+            .log_mid, .linear_mid))
+
+# 3. A known up-then-down site must be recovered as a turning pattern, with the turn placed
+#    between the sampled timepoints that bracket the true peak (index 3 = 5 min).
+.true_profile <- c(0, 0.8, 1.5, 1.1, 0.8, 0.2)
+.transient    <- 18 + rep(.true_profile, each = .n_rep) + rnorm(length(.tvect), 0, .sigma)
+
+# 4. A monotone site must not acquire a spurious reversal.
+.monotone <- 18 + rep(c(0, 0.3, 0.7, 1.1, 1.4, 1.9), each = .n_rep) + rnorm(length(.tvect), 0, .sigma)
+
+# 5. THE FALSE-POSITIVE CHECK. Flat sites must not acquire patterns. One flat site would be a
+#    coin toss, so 40 of them are pushed through and the *rate* is checked — the quantity that
+#    actually matters for the census below. Because the segment p-value is computed on 1 df (see
+#    the section above), the observed rate should come out well BELOW pvalCut, not at it.
+.n_flat <- 40
+.flat <- t(vapply(seq_len(.n_flat),
+                  function(i) 18 + rnorm(length(.tvect), 0, .sigma),
+                  numeric(length(.tvect))))
+rownames(.flat) <- paste0("flat", seq_len(.n_flat))
+
+.check_matrix <- rbind(transient = .transient, monotone = .monotone, .flat)
+colnames(.check_matrix) <- names(.tvect)
+
+.check_fit <- Trendy::trendy(Data        = .check_matrix,
+                             tVectIn     = .tvect,
+                             maxK        = MAX_K,
+                             minNumInSeg = MIN_NUM_IN_SEG,
+                             pvalCut     = PVAL_CUT,
+                             numTry      = NUM_TRY,
+                             meanCut     = MEAN_CUT,
+                             NCores      = 1)
+.check_tbl <- trendy_result_table(Trendy::results(.check_fit), .minutes_levels)
+print(.check_tbl[.check_tbl$site %in% c("transient", "monotone"),
+                 c("site", "pattern", "n_breakpoints", "breakpoint1_min", "adj_r2")],
+      row.names = FALSE)
+
+.transient_pattern <- .check_tbl$pattern[.check_tbl$site == "transient"]
+.monotone_pattern  <- .check_tbl$pattern[.check_tbl$site == "monotone"]
+.transient_bp      <- .check_tbl$breakpoint1_min[.check_tbl$site == "transient"]
+stopifnot(grepl("up", .transient_pattern), grepl("down", .transient_pattern))
+stopifnot(!grepl("down", .monotone_pattern))
+stopifnot(.transient_bp > 2, .transient_bp < 15)
+cat(sprintf("shape recovery   : transient -> '%s', turn at %.1f min (true peak 5 min)\n",
+            .transient_pattern, .transient_bp))
+cat(sprintf("                   monotone  -> '%s', no spurious reversal\n", .monotone_pattern))
+
+.flat_rows    <- grepl("^flat", .check_tbl$site)
+.false_rate   <- mean(.check_tbl$responsive[.flat_rows])
+.false_pattern <- mean(.check_tbl$pattern[.flat_rows] != "flat")
+cat(sprintf("flat-site null   : %.1f%% of %d pure-noise sites got a trend, %.1f%% a non-flat pattern\n",
+            100 * .false_rate, .n_flat, 100 * .false_pattern))
+cat(sprintf("                   (pvalCut = %.2f is an upper bound: the slope test uses 1 df)\n",
+            PVAL_CUT))
+stopifnot(.false_rate < 4 * PVAL_CUT)
+```
+
+⚠️ **On reproducibility.** `fitSegBIC` calls `jitter()` on the time vector whenever there are
+replicated times — which is always here — so two runs of the same data give breakpoints that differ
+by a small amount. With `NCORES = 1` and a `set.seed` this is reproducible; with `NCORES > 1`,
+`BiocParallel` is registered by Trendy itself without an RNG seed, so it is **not**. The jitter is
+about 0.02 of a time unit, so the effect on any conclusion is negligible, but a breakpoint quoted to
+three decimals is quoting noise.
+
+# Read the data
+
+```{r read-data}
+df <- stage(sprintf("read.delim (%.0f MB)", file.size(INPUT_FILE) / 1e6),
+            read.delim(INPUT_FILE,
+                       sep              = "\t",
+                       check.names      = FALSE,
+                       na.strings       = c("NA", "NaN", ""),
+                       stringsAsFactors = FALSE))
+
+cat(sprintf("parsed: %d sites x %d columns\n", nrow(df), ncol(df)))
+stopifnot(!anyDuplicated(df$site), "n:reps" %in% colnames(df))
+
+samples <- parse_condition_columns(colnames(df))
+cat(sprintf("samples for %s %s: %d columns = %d timepoints x %d replicates\n",
+            CELL_LINE, CONDITION, nrow(samples),
+            length(unique(samples$minutes)), length(unique(samples$plex))))
+cat("timepoints (min):", paste(sort(unique(samples$minutes)), collapse = ", "),
+    sprintf("   ('%s' excluded)\n", EXCLUDE))
+
+# Missing values must be NA, not 0. A fillna(0) that reached disk would be read here as a real
+# log2 intensity of 0 against a background of ~18, which Trendy would happily fit a giant
+# breakpoint to. This is the defect recorded in clustering_method_decision.md section 1.
+.values <- as.matrix(df[, samples$column, drop = FALSE])
+.n_zero <- sum(.values == 0, na.rm = TRUE)
+cat(sprintf("log2:abs cells: %.1f%% NA, %.1f%% exactly zero\n",
+            100 * sum(is.na(.values)) / length(.values),
+            100 * .n_zero / length(.values)))
+if (.n_zero > 0) {
+  cat("  WARNING: exact zeros in log2:abs — if these are missing values written as 0,\n",
+      "           fix upstream before trusting any pattern below.\n", sep = "")
+}
+```
+
+## Selecting the sites
+
+Two filters, for two different reasons.
+
+**`n:reps == 4` is not optional.** `trendy()` stops on the first `NA`, and TMT missingness is
+plex-wise, so a site seen in three plexes is missing an entire block of six samples. Sites below the
+threshold are absent from the output entirely; that absence says nothing about their biology.
+
+**The limma responsiveness filter is optional but recommended.** Segmenting a site that does not
+respond produces a `flat` pattern, which is correct but adds nothing, and Trendy is the slow step.
+`USE_FFDR` restricts the fit to sites the omnibus F-test already called responsive for this
+condition — the same gate `Clustering.ipynb` and the sigmoid notebook use, so the three analyses
+describe the same set of sites.
+
+```{r select-sites}
+ffdr_column <- paste0(CELL_LINE, "_log2:FFDR_", CONDITION, "_omnibus")
+
+eligible <- !is.na(df[["n:reps"]]) & df[["n:reps"]] >= MIN_REPS
+cat(sprintf("n:reps >= %d                      : %d of %d sites\n",
+            MIN_REPS, sum(eligible), nrow(df)))
+
+if (REQUIRE_COMPLETE) {
+  complete <- stats::complete.cases(.values)
+  cat(sprintf("+ complete across all %2d samples  : %d\n", nrow(samples), sum(eligible & complete)))
+  eligible <- eligible & complete
+}
+
+if (USE_FFDR) {
+  if (!ffdr_column %in% colnames(df)) {
+    stop("select-sites: '", ffdr_column, "' is not in the input file. Run ",
+         "limma_for_pvalues.rmd and merge its output, or set USE_FFDR <- FALSE.")
+  }
+  responsive <- !is.na(df[[ffdr_column]]) & df[[ffdr_column]] < MAX_FFDR
+  cat(sprintf("+ limma FFDR < %.2f               : %d   <- fitted\n",
+              MAX_FFDR, sum(eligible & responsive)))
+  eligible <- eligible & responsive
+}
+
+if (is.finite(MAX_SITES) && sum(eligible) > MAX_SITES) {
+  eligible[which(eligible)[-seq_len(MAX_SITES)]] <- FALSE
+  cat("  NOTE: MAX_SITES is set — only", MAX_SITES, "sites will be fitted.\n")
+}
+stopifnot(sum(eligible) > 0)
+```
+
+## Building the matrix Trendy fits
+
+```{r build-matrix}
+M <- as.matrix(df[eligible, samples$column, drop = FALSE])
+rownames(M) <- df$site[eligible]
+storage.mode(M) <- "double"
+stopifnot(!anyNA(M))
+
+M <- stage(paste0("normalise (", NORMALIZE, ")"), normalize_matrix(M, NORMALIZE))
+
+if (PLEX_CENTER) {
+  before <- apply(M, 2, median)
+  M <- stage("centre plex offsets", center_plex(M, samples$plex))
+  after <- apply(M, 2, median)
+  cat(sprintf("     per-channel median spread: %.3f log2 before -> %.3f after\n",
+              diff(range(before)), diff(range(after))))
+}
+
+tvect <- build_time_vector(samples, TIME_AXIS)
+minutes_levels <- sort(unique(samples$minutes))
+
+cat(sprintf("matrix: %d sites x %d samples | axis '%s', values %s\n",
+            nrow(M), ncol(M), TIME_AXIS,
+            paste(sprintf("%g", sort(unique(tvect))), collapse = ", ")))
+stopifnot(!is.unsorted(tvect))   # Trendy assumes tVectIn ascends
+```
+
+# Run Trendy
+
+`maxK` is capped at whatever this design can actually support, and Trendy applies its own caps on
+top (`floor(nSamples / minNumInSeg) - 1`, and `nUniqueTimes - 2`) — both are reported so it is
+visible when the requested value was not the one used.
+
+```{r run-trendy}
+max_k_supported <- min(MAX_K,
+                       floor(ncol(M) / MIN_NUM_IN_SEG) - 1,
+                       length(minutes_levels) - 2)
+if (max_k_supported < MAX_K) {
+  cat(sprintf("NOTE: MAX_K reduced from %d to %d by the design ",
+              MAX_K, max_k_supported),
+      sprintf("(%d samples, %d time levels, minNumInSeg = %d)\n",
+              ncol(M), length(minutes_levels), MIN_NUM_IN_SEG))
+}
+stopifnot(max_k_supported >= 1)
+
+set.seed(SEED)
+trendy_out <- stage(sprintf("Trendy: %d sites, maxK = %d", nrow(M), max_k_supported),
+                    Trendy::trendy(Data        = M,
+                                   tVectIn     = tvect,
+                                   maxK        = max_k_supported,
+                                   minNumInSeg = MIN_NUM_IN_SEG,
+                                   pvalCut     = PVAL_CUT,
+                                   numTry      = NUM_TRY,
+                                   meanCut     = MEAN_CUT,
+                                   NCores      = NCORES))
+
+trendy_fits <- Trendy::results(trendy_out)
+cat(sprintf("fitted %d sites\n", length(trendy_fits)))
+```
+
+```{r assemble}
+patterns <- stage("assemble the pattern table",
+                  trendy_result_table(trendy_fits, minutes_levels, max_k_supported, ADJ_R2_CUT))
+
+cat(sprintf("\nsites fitted                 : %d\n", nrow(patterns)))
+cat(sprintf("with at least one breakpoint : %d (%.1f%%)\n",
+            sum(patterns$n_breakpoints > 0),
+            100 * mean(patterns$n_breakpoints > 0)))
+cat(sprintf("adjusted R2 >= %.2f           : %d (%.1f%%)\n",
+            ADJ_R2_CUT, sum(patterns$r2_ok), 100 * mean(patterns$r2_ok)))
+cat(sprintf("non-flat AND R2 gate passed  : %d (%.1f%%)\n",
+            sum(patterns$pattern_ok), 100 * mean(patterns$pattern_ok)))
+
+head(patterns[, c("site", "pattern", "n_breakpoints", "breakpoint1_min",
+                  "breakpoint2_min", "adj_r2", "pattern_ok")], 10)
+```
+
+# The pattern census
+
+The headline result: how many sites follow each temporal pattern. Read it the way the shape census
+in `src/response_shapes.py` is read — the point is the *distribution*, and the fraction of sites a
+monotone model could not have described.
+
+```{r pattern-census}
+census <- pattern_census(patterns$pattern,
+                         groups = list(r2_ok = patterns$r2_ok))
+print(census, row.names = FALSE)
+
+# The comparison that matters against the sigmoid work: how many sites turn over?
+turning <- grepl("up-down|down-up", patterns$pattern)
+cat(sprintf("\nsites with a direction reversal (up-down or down-up): %d (%.1f%%)\n",
+            sum(turning), 100 * mean(turning)))
+cat("  ^ these are the sites a monotone sigmoid structurally cannot represent\n")
+cat(sprintf("sites fitted as a single flat segment                 : %d (%.1f%%)\n",
+            sum(patterns$pattern == "flat"), 100 * mean(patterns$pattern == "flat")))
+```
+
+```{r census-plot, fig.width=8, fig.height=4.5}
+top <- head(census[order(-census$n), ], 12)
+old_par <- par(mar = c(9, 4, 3, 1))
+barplot(top$n,
+        names.arg = top$pattern,
+        las       = 2,
+        col       = "steelblue",
+        ylab      = "sites",
+        main      = sprintf("Trendy pattern census — %s %s (n = %d)",
+                            CELL_LINE, CONDITION, nrow(patterns)))
+par(old_par)
+```
+
+## When do sites turn over?
+
+The breakpoint distribution is the quantity no other method in this project produces: a *fitted*
+turning time, not a grid position. The sampled timepoints are drawn on the plot, because a
+breakpoint distribution that simply reproduces the sampling grid is telling you about the design
+rather than about the biology.
+
+```{r breakpoint-distribution, fig.width=9, fig.height=4}
+bp_minutes <- c(patterns$breakpoint1_min, patterns$breakpoint2_min)
+bp_minutes <- bp_minutes[is.finite(bp_minutes)]
+
+old_par <- par(mfrow = c(1, 2))
+hist(bp_minutes,
+     breaks = 40,
+     col    = "grey70",
+     xlab   = "breakpoint (min)",
+     main   = "All breakpoints, in minutes")
+abline(v = minutes_levels, col = "crimson", lty = 3)
+
+hist(patterns$breakpoint1_axis[is.finite(patterns$breakpoint1_axis)],
+     breaks = 30,
+     col    = "grey70",
+     xlab   = sprintf("first breakpoint (%s axis)", TIME_AXIS),
+     main   = "First breakpoint, on the fitting axis")
+par(old_par)
+
+cat(sprintf("median first breakpoint: %.1f min   (IQR %.1f - %.1f)\n",
+            median(patterns$breakpoint1_min, na.rm = TRUE),
+            quantile(patterns$breakpoint1_min, 0.25, na.rm = TRUE),
+            quantile(patterns$breakpoint1_min, 0.75, na.rm = TRUE)))
+```
+
+## Trendy's own summaries
+
+`topTrendy` keeps the sites above the adjusted-R² cutoff and reshapes them into the matrix form the
+package's plotting functions expect. `trendHeatmap` then orders sites by the direction of their
+first segment and by when they first change, which is the closest thing Trendy has to a clustering:
+sites that turn on at the same time end up adjacent.
+
+```{r top-trendy, fig.width=7, fig.height=8}
+top_trendy <- tryCatch(Trendy::topTrendy(trendy_fits, adjR2Cut = ADJ_R2_CUT),
+                       error = function(e) {
+                         cat("topTrendy:", conditionMessage(e), "\n")
+                         NULL
+                       })
+
+if (!is.null(top_trendy)) {
+  cat(sprintf("topTrendy kept %d sites at adjusted R2 >= %.2f\n",
+              length(top_trendy$AdjustedR2), ADJ_R2_CUT))
+  trend_order <- Trendy::trendHeatmap(top_trendy)
+  cat(sprintf("first segment up: %d | down: %d | no change: %d\n",
+              length(trend_order$firstup),
+              length(trend_order$firstdown),
+              length(trend_order$firstnochange)))
+}
+```
+
+## Sites following a specific pattern
+
+`extractPattern` searches the fitted trend sequences for a pattern and returns the sites that
+follow it together with the breakpoint at which it starts. `up-down` is the transient response —
+the shape the sigmoid work had to exclude.
+
+```{r extract-patterns}
+for (wanted in list(c("up", "down"), c("down", "up"), c("up", "same"))) {
+  found <- tryCatch(Trendy::extractPattern(trendy_fits,
+                                           Pattern  = wanted,
+                                           adjR2Cut = ADJ_R2_CUT),
+                    error = function(e) NULL)
+  label <- paste(wanted, collapse = " -> ")
+  if (is.null(found) || nrow(found) == 0) {
+    cat(sprintf("%-16s : no sites\n", label))
+  } else {
+    cat(sprintf("%-16s : %d sites, median turn at %.1f min\n",
+                label, nrow(found),
+                median(axis_to_minutes(as.numeric(found[, 2]), minutes_levels), na.rm = TRUE)))
+  }
+}
+```
+
+## Individual fits
+
+`plotFeature` draws the observed replicates with the fitted segments on top. Look at these before
+believing any census: the fits either visibly track the data or they do not.
+
+```{r plot-examples, fig.width=10, fig.height=7}
+pathway_proteins <- c("EGFR", "SOS1", "GAB1", "BRAF", "RAF1", "MAP2K1", "MAPK1", "MAPK3",
+                      "SHC1", "GRB2", "SHOC2", "RPS6KA1", "RPS6KA3")
+
+is_pathway <- df$protein_name[eligible] %in% pathway_proteins
+show_sites <- rownames(M)[is_pathway]
+show_sites <- head(show_sites[show_sites %in% names(trendy_fits)], 6)
+
+if (length(show_sites) > 0) {
+  old_par <- par(mfrow = c(2, 3))
+  Trendy::plotFeature(Data          = M,
+                      tVectIn       = tvect,
+                      featureNames  = show_sites,
+                      trendyOutData = trendy_fits,
+                      simple        = TRUE,
+                      xlab          = sprintf("time (%s axis)", TIME_AXIS),
+                      ylab          = "log2 intensity")
+  par(old_par)
+} else {
+  cat("no MAPK-pathway sites among the fitted set\n")
+}
+```
+
+```{r plot-best-worst, fig.width=10, fig.height=7}
+# The best- and worst-fitting sites that still produced a pattern. Looking at both ends of the
+# quality distribution is the cheapest way to catch a systematic problem the census averages away.
+with_pattern <- patterns[patterns$responsive, ]
+with_pattern <- with_pattern[order(-with_pattern$adj_r2), ]
+extremes <- c(head(with_pattern$site, 3), tail(with_pattern$site, 3))
+
+old_par <- par(mfrow = c(2, 3))
+Trendy::plotFeature(Data          = M,
+                    tVectIn       = tvect,
+                    featureNames  = extremes,
+                    trendyOutData = trendy_fits,
+                    simple        = TRUE,
+                    xlab          = sprintf("time (%s axis)", TIME_AXIS),
+                    ylab          = "log2 intensity")
+par(old_par)
+cat("top row: highest adjusted R2 | bottom row: lowest, among sites with a non-flat pattern\n")
+```
+
+# Verification
+
+Three checks against things already established elsewhere in the project. None of them is a
+formality: each one has a way of failing that would invalidate the census above.
+
+```{r verify-against-limma}
+# 1. Trendy and limma must broadly agree about which sites do something. They are different tests
+#    (segment slopes vs contrasts against starve), so agreement will not be perfect — but if sites
+#    Trendy calls flat were NOT enriched in limma-non-significant sites, the fit is not tracking
+#    the data at all.
+if (ffdr_column %in% colnames(df)) {
+  ffdr <- df[[ffdr_column]][match(patterns$site, df$site)]
+  flat <- patterns$pattern == "flat"
+  cat(sprintf("median limma FFDR, sites Trendy calls flat    : %.3g  (n = %d)\n",
+              median(ffdr[flat], na.rm = TRUE), sum(flat)))
+  cat(sprintf("median limma FFDR, sites with a fitted trend  : %.3g  (n = %d)\n",
+              median(ffdr[!flat], na.rm = TRUE), sum(!flat)))
+} else {
+  cat("no FFDR column in this file — skipping the limma comparison\n")
+}
+```
+
+```{r verify-breakpoint-range}
+# 2. Every breakpoint must lie inside the observed window. A breakpoint outside it is an
+#    extrapolation: a turn claimed at a time the experiment never sampled.
+bp_all <- c(patterns$breakpoint1_min, patterns$breakpoint2_min)
+bp_all <- bp_all[is.finite(bp_all)]
+outside <- sum(bp_all < min(minutes_levels) | bp_all > max(minutes_levels))
+cat(sprintf("breakpoints outside [%g, %g] min: %d of %d\n",
+            min(minutes_levels), max(minutes_levels), outside, length(bp_all)))
+stopifnot(outside == 0)
+
+# Breakpoints landing in the 15-90 min gap are interpolations into unsampled time: legal, but
+# they are the fit's opinion rather than an observation, and should be reported as such.
+in_gap <- sum(bp_all > 15 & bp_all < 90)
+cat(sprintf("breakpoints inside the unsampled 15-90 min gap: %d (%.1f%%)  <- interpolated, not observed\n",
+            in_gap, 100 * in_gap / length(bp_all)))
+```
+
+```{r verify-r2}
+# 3. The adjusted R2 distribution. A pile near zero means the segments are not describing the
+#    data, whatever pattern strings came out.
+cat(sprintf("adjusted R2: median %.3f | IQR %.3f - %.3f | %% negative %.1f\n",
+            median(patterns$adj_r2, na.rm = TRUE),
+            quantile(patterns$adj_r2, 0.25, na.rm = TRUE),
+            quantile(patterns$adj_r2, 0.75, na.rm = TRUE),
+            100 * mean(patterns$adj_r2 < 0, na.rm = TRUE)))
+hist(patterns$adj_r2, breaks = 50, col = "grey70",
+     xlab = "adjusted R2", main = "Fit quality across sites")
+abline(v = ADJ_R2_CUT, col = "crimson", lty = 2)
+```
+
+# Write the results
+
+One row per **fitted** site, written next to the input in
+`Experiment/{dataset}/Data/Processed/`, never over it. Sites that were not fitted (missing
+replicates, or filtered out by `USE_FFDR`) are absent — the annotation columns carried through make
+it possible to see which.
+
+```{r write-results}
+annotation_columns <- intersect(c("site", "protein_name", "protein_Id", "n:reps", ffdr_column),
+                                colnames(df))
+output <- merge(df[eligible, annotation_columns, drop = FALSE],
+                patterns,
+                by  = "site",
+                all = FALSE)
+
+# Provenance: what this table was produced with, so a stale file cannot be mistaken for a fresh one.
+output$condition      <- CONDITION
+output$cell_line      <- CELL_LINE
+output$time_axis      <- TIME_AXIS
+output$max_k          <- max_k_supported
+output$min_num_in_seg <- MIN_NUM_IN_SEG
+output$pval_cut       <- PVAL_CUT
+output$plex_centered  <- PLEX_CENTER
+output$normalize      <- NORMALIZE
+
+cat(sprintf("output table: %d rows x %d columns\n", nrow(output), ncol(output)))
+
+if (SAVE_TABLE) {
+  stage(paste("write", basename(OUTPUT_FILE)),
+        write.table(output,
+                    file      = OUTPUT_FILE,
+                    sep       = "\t",
+                    row.names = FALSE,
+                    quote     = FALSE,
+                    na        = "NA"))
+  cat("wrote", OUTPUT_FILE, "\n")
+} else {
+  cat("SAVE_TABLE is FALSE — nothing written.\n")
+}
+```
+
+# Output columns
+
+| Column | Meaning |
+|---|---|
+| `site`, `protein_name`, `protein_Id`, `n:reps` | identity, carried from the input |
+| `pattern` | the result: segment trends joined by `-`, e.g. `up-down`, `up-flat`, `flat` |
+| `n_segments`, `n_breakpoints` | how many pieces the fit has; `n_breakpoints = 0` means plain linear regression won on BIC |
+| `first_trend`, `last_trend` | the first and last segment's direction — convenient for filtering |
+| `responsive` | TRUE if any segment has a significant slope (`pvalCut`) |
+| `adj_r2`, `r2_ok` | adjusted R² of the fit, and whether it clears `ADJ_R2_CUT` |
+| `pattern_ok` | `responsive & r2_ok` — the flag to filter on before interpreting a pattern |
+| `segmentN_slope` | slope of segment N, in log2 units per unit of the fitting axis |
+| `segmentN_trend` | `up` / `down` / `flat` |
+| `segmentN_pvalue` | p-value of that segment's slope |
+| `breakpointN_axis` | fitted breakpoint on the fitting axis (index / minutes / log) |
+| `breakpointN_min` | the same breakpoint converted to **minutes** — the interpretable one |
+| `condition` … `normalize` | provenance: the settings this table was produced with |
+
+⚠️ `segmentN_slope` is in units of the **fitting axis**. On the default `index` axis it is "log2
+units per timepoint step", which is comparable *between sites* but is not a rate per minute. Convert
+via `breakpointN_min` if a rate is needed, and state which axis was used.
+
+# Caveats to carry into any interpretation
+
+1. **Six time levels.** Everything above rests on six distinct times. A 2-breakpoint call uses all
+   of them and leaves nothing to check the shape with. Treat `n_breakpoints = 2` as descriptive.
+2. **Only complete sites are analysable.** Trendy refuses `NA`, so this is an analysis of the
+   `n:reps == 4` subset. That subset is biased towards abundant, well-behaved peptides.
+3. **Breakpoints in the 15–90 min gap are interpolations.** The verification chunk counts them.
+   Nothing was measured between 15 and 90 minutes, and a turn placed at 40 min is the fit's opinion.
+4. **`flat` is not the same as "no response", and it is a conservative call.** A site that rises and
+   returns symmetrically within one segment is reported flat, and so is any site whose slope misses
+   the 1-df significance test described above (roughly $|t| < 3.1$). Cross-check against the limma
+   FFDR column, which is in the output for exactly this reason.
+5. **Loading normalisation is still unfixed upstream** (CLAUDE.md → Known issues). `PLEX_CENTER`
+   removes the plex-level offset, not the per-channel one. Re-run with `NORMALIZE <- "median"` to
+   bracket the effect, as the sigmoid notebook does with its census.
+6. **The pattern alphabet is coarse.** `up-down` covers a spike at 2 min and a broad hump peaking at
+   15 min. The breakpoint time and the segment slopes distinguish them; the pattern string does not.
+
+# Where this goes next
+
+- **Cross-tabulate against the shape census.** `src/response_shapes.py` classifies the same sites
+  into `transient` / `sustained` / `monotonic` / `biphasic` from the fold-change profile with no
+  fitting at all. The two should agree on the gross split, and where they disagree is informative:
+  Trendy adds a fitted turning time to the classes the census can only name.
+- **Compare the turning time to T50.** For sites that are both `sigmoid_legitimate` and fitted here
+  as `up-flat`, the first breakpoint and the sigmoid T50 are estimating related quantities by
+  different routes — a genuine mutual validation, in the spirit of the CurveCurator cross-check.
+- **Crosstalk.** Rerun with `CONDITION <- "INS"` and `"EGFnINS"` and compare patterns per site: a
+  site whose pattern is `up-down` under EGF but `up-flat` under co-stimulation has had its
+  *shut-off* altered, which is a different claim from an amplitude change and is invisible to the
+  clustering.
+- **The mutant lines.** The same fit on `hme1_lfq` (9 timepoints) is a much better-posed problem —
+  `maxK = 3` becomes defensible, and the breakpoint standard errors from `segmented` become worth
+  reporting.
+- **Breakpoint uncertainty.** `segmented` returns a standard error for each `psi`. Trendy discards
+  it (`keepFit = FALSE` drops the fit object). Setting `keepFit = TRUE` and pulling
+  `fit$Fit$psi[, "St.Err"]` would give per-site breakpoint errors — necessary before any claim that
+  two sites turn over at different times.
+
+```{r session-info}
+sessionInfo()
+```

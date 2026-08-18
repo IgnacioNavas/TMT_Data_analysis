@@ -482,6 +482,102 @@ def compute_zscore_fc(df: pd.DataFrame,
     return result
 
 
+def log2_step_size(df: pd.DataFrame,
+                   cell_line: str = "WT",
+                   conditions: list = ['_EGF_', '_INS_', '_EGFnINS_'],
+                   baseline: str = "starve",
+                   exclude_full: bool = True,) -> pd.DataFrame:
+    """
+    Compute the step size between consecutive timepoints of the log2:FC profile.
+
+    Where log2:FC measures each timepoint against the starve baseline, log2:step
+    measures each timepoint against the timepoint immediately before it, i.e. the
+    increment of phosphorylation gained (or lost) during that interval:
+
+        log2:step(t_i) = log2:FC(t_i) − log2:FC(t_{i-1})
+
+    with the baseline timepoint ('starve' by default) as t_0. Since
+    log2:FC(starve) is identically 0, the first stimulation timepoint reproduces
+    its own log2:FC value; the baseline column itself is subtracted explicitly
+    rather than assumed to be 0, so the function stays correct if it is ever
+    computed against a different reference.
+
+    Step columns exist only for the timepoints AFTER the baseline — there is no
+    log2:step for 'full' or for 'starve' itself, since neither has a preceding
+    timepoint inside the stimulation series. 'full' is excluded from the chain by
+    default (exclude_full=True); it is a separate media control, not the
+    timepoint preceding starve, so including it would make the first step a
+    full → starve difference rather than a stimulation step.
+
+    Note that the steps are differences over UNEQUAL time intervals (the grid
+    {2, 5, 10, 15, 90} min is roughly log-spaced), so a step is an increment per
+    interval, not a rate per minute. Divide by the interval width if a rate is
+    what is wanted.
+
+    Missing values propagate: if either timepoint of a pair is NaN the step is NaN.
+
+    Output column names:
+        {cell_line}_log2:step_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:FC columns (produced by compute_fold_change).
+        cell_line: cell line identifier prefix, e.g. 'WT'.
+        conditions: list of condition substrings to match, e.g. ['_EGF_', '_INS_'].
+        baseline: timepoint used as the first reference of the chain, default 'starve'.
+        exclude_full: if True (default) the 'full' timepoint is left out of the
+            chain entirely, so no step column is produced for it and it is never
+            used as a previous timepoint.
+
+    Returns:
+        Copy of df with the new log2:step columns appended, one per condition per
+        timepoint after the baseline, in experimental time order.
+    """
+    result = df.copy()
+    step_cols = {}
+
+    for condition in conditions:
+        fc_cols = ColumnSpec.select(result, cell_lines=[cell_line], data_type="log2:FC",
+                                    conditions=[condition], exclude_full=exclude_full,)
+        if not fc_cols:
+            warnings.warn(
+                f"log2_step_size: no log2:FC columns found for "
+                f"cell_line='{cell_line}', condition='{condition}'."
+            )
+            continue
+
+        treatment = condition.strip('_')
+        timepoints = _sort_timepoints_numeric(
+            ColumnSpec.timepoints_from(result, cell_line=cell_line, data_type="log2:FC",
+                                       condition=condition,)
+        )
+        if exclude_full:
+            timepoints = [tp for tp in timepoints if tp != "full"]
+
+        if baseline not in timepoints:
+            warnings.warn(
+                f"log2_step_size: baseline timepoint '{baseline}' not found for "
+                f"treatment '{treatment}' — the first available timepoint "
+                f"('{timepoints[0]}') is used as the chain reference instead and "
+                f"gets no step column."
+            )
+        else:
+            # Chain always starts at the baseline, whatever its position in the sort order.
+            timepoints = [baseline] + [tp for tp in timepoints if tp != baseline]
+
+        for previous_tp, timepoint in zip(timepoints[:-1], timepoints[1:]):
+            previous_col = f"{cell_line}_log2:FC_{treatment}_{previous_tp}"
+            current_col = f"{cell_line}_log2:FC_{treatment}_{timepoint}"
+            if previous_col not in result.columns or current_col not in result.columns:
+                continue
+            step_col = f"{cell_line}_log2:step_{treatment}_{timepoint}"
+            step_cols[step_col] = result[current_col] - result[previous_col]
+
+    for col_name, series in step_cols.items():
+        result[col_name] = series
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # DEPRECATED — statistics moved to R/limma (2026-08-06)
 # ---------------------------------------------------------------------------
@@ -710,6 +806,653 @@ def run_all_transformations(df: pd.DataFrame,
     print(f"\nAll cell lines processed. Total columns: {original_ncols} -> {result.shape[1]}")
     return result
 
+
+# ---------------------------------------------------------------------------
+# diaPASEF (LFQ) transformations
+# ---------------------------------------------------------------------------
+# Parallel implementation of the transformation chain for the hme1_lfq diaPASEF
+# dataset. The functions above were written for a single TMT cell line and are
+# kept untouched; these differ in three ways that matter for this dataset:
+#
+#   1. Timepoint order. _sort_timepoints() sorts against the fixed _TP_ORDER list
+#      and appends anything unknown afterwards, so the diaPASEF grid
+#      {full, starve, 2, 5, 10, 15, 20, 30, 90} comes out as ... 15, 90, 20, 30.
+#      _sort_timepoints_numeric() below sorts the numeric labels by value instead.
+#   2. All 8 cell lines are handled in one pass, and each column is assigned to a
+#      cell line by its exact first field rather than by str.startswith, so a name
+#      that prefixes another (BRAFS151A vs BRAFS151A1/2) cannot pull in both.
+#   3. New columns are attached with a single pd.concat per statistic block rather
+#      than one insertion at a time — this dataset adds ~1500 columns, where
+#      repeated single-column insertion both fragments the frame and is slow.
+#
+# Chain produced:
+#     raw:mean, raw:median, raw:sd, raw:cv
+#     log2:abs (zeros treated as NaN)
+#     log2:mean, log2:median, log2:sd
+#     log2:FC     (vs starve; sites with no starve abundance stay NaN)
+#     log2:scaled (amplitude normalisation, per cell line across conditions)
+#     log2:zscore (shape normalisation, per cell line per condition)
+#
+# The two normalisations mirror compute_scaled_fc / compute_zscore_fc but differ in
+# one deliberate way: which timepoints define the normalisation basis. In the TMT
+# functions the basis is every timepoint present, `full` included — and `full` is a
+# different media state, not a response to stimulation, so it inflates the scaling
+# denominator and, for the z-score, was measured to carry ~26% of the clustering
+# variance on hme1_2 (see clustering_method_decision.md §1). Here the basis is
+# explicit and excludes `full` by default (and `starve` as well for the z-score, where
+# it is a structural zero). The columns are still written for every timepoint, so
+# nothing is lost — only the basis over which they are standardised changes.
+# ---------------------------------------------------------------------------
+
+def _split_data_column(col: str) -> dict:
+    """
+    Split a data-column name into its naming-convention fields.
+
+    Args:
+        col: column name, e.g. 'WT_raw:abs_EGF_2_r1' or 'WT_log2:FC_EGF_2'.
+
+    Returns:
+        Dict with keys cell_line, data_type, condition, timepoint, replicate
+        (replicate is '' for columns without a replicate suffix), or None if the
+        name has fewer than the four mandatory fields.
+    """
+    parts = col.split("_")
+    if len(parts) < 4:
+        return None
+    return {"cell_line": parts[0],
+            "data_type": parts[1],
+            "condition": parts[2],
+            "timepoint": parts[3],
+            "replicate": parts[4] if len(parts) > 4 else "",}
+
+
+def _sort_timepoints_numeric(timepoints) -> list:
+    """
+    Sort timepoint labels as full, starve, then every numeric label by value.
+
+    Unlike _sort_timepoints() this does not rely on a hard-coded list of known
+    timepoints, so timepoint grids that differ between datasets (the diaPASEF grid
+    adds 20 and 30 min) still come out in experimental order. Labels that are
+    neither named nor numeric are appended alphabetically rather than dropped.
+
+    Args:
+        timepoints: iterable of timepoint labels, e.g. ['90', '2', 'full', '20'].
+
+    Returns:
+        List of the unique labels in experimental order.
+    """
+    labels = list(dict.fromkeys(timepoints))
+    named = [tp for tp in ("full", "starve",) if tp in labels]
+    numeric = sorted([tp for tp in labels
+                      if tp not in ("full", "starve",) and str(tp).replace(".", "", 1).isdigit()],
+                     key=float)
+    other = sorted([tp for tp in labels if tp not in named and tp not in numeric])
+    return named + numeric + other
+
+
+def dia_parse_groups(df: pd.DataFrame,
+                     cell_lines: list = None,
+                     conditions: list = None,
+                     data_type: str = "raw:abs") -> dict:
+    """
+    Group the replicate columns of every cell line by condition and timepoint.
+
+    Equivalent to parse_columns(replicates=True) but for all cell lines at once,
+    matching the cell line on the exact first field of the column name and ordering
+    timepoints with _sort_timepoints_numeric.
+
+    Args:
+        df: DataFrame following the project naming convention.
+        cell_lines: list of cell-line prefixes, e.g. ['WT', 'EGFRT693A']. If None,
+            every cell line found among the `data_type` replicate columns is used.
+        conditions: list of condition substrings, e.g. ['_EGF_']; the surrounding
+            underscores are optional. If None, every condition found is used.
+        data_type: DataType field of the input columns, default 'raw:abs'.
+
+    Returns:
+        Nested dict {cell_line: {condition: {timepoint: [replicate columns]}}},
+        with conditions keyed in the '_EGF_' delimited form used by the rest of
+        this module, and timepoints in experimental order.
+    """
+    # ColumnSpec does the naming-convention selection; the exact-field check below
+    # then guards against its startswith() matching of the cell-line prefix.
+    all_cells = list(dict.fromkeys(
+        info["cell_line"] for info in (_split_data_column(c) for c in df.columns)
+        if info is not None and info["data_type"] == data_type and info["replicate"]))
+    all_conds = list(dict.fromkeys(
+        info["condition"] for info in (_split_data_column(c) for c in df.columns)
+        if info is not None and info["data_type"] == data_type and info["replicate"]))
+
+    if cell_lines is None:
+        cell_lines = all_cells
+    if conditions is None:
+        conditions = all_conds
+    conditions = [f"_{c.strip('_')}_" for c in conditions]
+
+    groups: dict = {}
+    for cell_line in cell_lines:
+        cell_groups: dict = {}
+        for condition in conditions:
+            cols = ColumnSpec.select(df,
+                                     cell_lines=[cell_line],
+                                     data_type=data_type,
+                                     conditions=[condition],)
+            timepoint_cols: dict = {}
+            for col in cols:
+                info = _split_data_column(col)
+                if info is None or not info["replicate"]:
+                    continue
+                if info["cell_line"] != cell_line or info["condition"] != condition.strip("_"):
+                    continue
+                timepoint_cols.setdefault(info["timepoint"], []).append(col)
+
+            if timepoint_cols:
+                cell_groups[condition] = {tp: timepoint_cols[tp]
+                                          for tp in _sort_timepoints_numeric(timepoint_cols.keys())}
+
+        if cell_groups:
+            groups[cell_line] = cell_groups
+        else:
+            warnings.warn(f"dia_parse_groups: no '{data_type}' replicate columns found for "
+                          f"cell_line='{cell_line}' — skipped.")
+
+    return groups
+
+
+def dia_compute_raw_stats(df: pd.DataFrame,
+                          groups: dict,
+                          min_reps: int = 1) -> pd.DataFrame:
+    """
+    Compute raw:mean, raw:median, raw:sd and raw:cv per cell line × condition × timepoint.
+
+    Zeros are treated as missing alongside NaN, so a site that was not detected in a
+    replicate does not drag its mean towards zero. The statistics are taken over the
+    detected replicates only.
+
+    Output column order: all means, then all medians, then all sds, then all cvs;
+    within each block, cell line, then condition, then timepoint in experimental order.
+
+    Output column names (no replicate suffix):
+        {cell_line}_raw:mean_{treatment}_{timepoint}
+        {cell_line}_raw:median_{treatment}_{timepoint}
+        {cell_line}_raw:sd_{treatment}_{timepoint}     (sample sd, ddof=1 — NaN for 1 replicate)
+        {cell_line}_raw:cv_{treatment}_{timepoint}     (sd / |mean| × 100; NaN where mean = 0)
+
+    Args:
+        df: DataFrame with raw:abs replicate columns.
+        groups: nested dict returned by dia_parse_groups().
+        min_reps: minimum number of detected replicates required for a statistic to
+            be reported; groups with fewer detections give NaN. Default 1 (report
+            whatever was detected).
+
+    Returns:
+        Copy of df with the new statistic columns appended.
+    """
+    means, medians, sds, cvs = {}, {}, {}, {}
+
+    for cell_line, cell_groups in groups.items():
+        for condition, timepoints in cell_groups.items():
+            treatment = condition.strip("_")
+            for timepoint in _sort_timepoints_numeric(timepoints.keys()):
+                cols = timepoints[timepoint]
+                data = df[cols].replace(0, np.nan)
+                enough = data.notna().sum(axis=1) >= min_reps
+                pfx = f"{cell_line}_raw"
+
+                mean = data.mean(axis=1, skipna=True).where(enough)
+                sd = data.std(axis=1, skipna=True).where(enough)
+
+                cv = sd / mean.abs() * 100
+                cv[mean == 0] = np.nan
+
+                means[f"{pfx}:mean_{treatment}_{timepoint}"] = mean
+                medians[f"{pfx}:median_{treatment}_{timepoint}"] = data.median(axis=1, skipna=True).where(enough)
+                sds[f"{pfx}:sd_{treatment}_{timepoint}"] = sd
+                cvs[f"{pfx}:cv_{treatment}_{timepoint}"] = cv
+
+    new_cols = {**means, **medians, **sds, **cvs}
+    return pd.concat([df.copy(), pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+
+def dia_compute_log2_abs(df: pd.DataFrame,
+                         groups: dict) -> tuple:
+    """
+    Compute log2 of every raw:abs replicate column.
+
+    Zeros are replaced with NaN before the transformation: log2(0) is undefined, and a
+    zero here means "not detected", not "abundance zero". NaN stays NaN.
+
+    Output column names (replicate suffix retained):
+        {cell_line}_log2:abs_{treatment}_{timepoint}_{replicate}
+
+    Args:
+        df: DataFrame with raw:abs replicate columns.
+        groups: nested dict returned by dia_parse_groups().
+
+    Returns:
+        Tuple (updated_df, log2_groups), where log2_groups mirrors the structure of
+        `groups` but maps to the new log2:abs column names — pass it to
+        dia_compute_log2_stats() and dia_compute_fold_change().
+    """
+    new_cols = {}
+    log2_groups: dict = {}
+
+    for cell_line, cell_groups in groups.items():
+        log2_groups[cell_line] = {}
+        for condition, timepoints in cell_groups.items():
+            treatment = condition.strip("_")
+            log2_groups[cell_line][condition] = {}
+            for timepoint in _sort_timepoints_numeric(timepoints.keys()):
+                tp_cols = []
+                for col in timepoints[timepoint]:
+                    replicate = col.split("_")[-1]
+                    new_col = f"{cell_line}_log2:abs_{treatment}_{timepoint}_{replicate}"
+                    new_cols[new_col] = np.log2(df[col].replace(0, np.nan))
+                    tp_cols.append(new_col)
+                if tp_cols:
+                    log2_groups[cell_line][condition][timepoint] = tp_cols
+
+    result = pd.concat([df.copy(), pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return result, log2_groups
+
+
+def dia_compute_log2_stats(df: pd.DataFrame,
+                           log2_groups: dict,
+                           min_reps: int = 1) -> pd.DataFrame:
+    """
+    Compute log2:mean, log2:median and log2:sd per cell line × condition × timepoint.
+
+    These are statistics *of the log2 values*, not the log2 of the raw statistics: the
+    mean of log2:abs is the log2 geometric mean of the intensities, which is the scale
+    the fold changes and all downstream modelling work on.
+
+    Output column order: all means, then all medians, then all sds.
+
+    Output column names (no replicate suffix):
+        {cell_line}_log2:mean_{treatment}_{timepoint}
+        {cell_line}_log2:median_{treatment}_{timepoint}
+        {cell_line}_log2:sd_{treatment}_{timepoint}    (sample sd, ddof=1)
+
+    Args:
+        df: DataFrame with log2:abs replicate columns.
+        log2_groups: nested dict returned by dia_compute_log2_abs().
+        min_reps: minimum number of detected replicates required for a statistic to be
+            reported; groups with fewer detections give NaN. Default 1.
+
+    Returns:
+        Copy of df with the new log2 statistic columns appended.
+    """
+    means, medians, sds = {}, {}, {}
+
+    for cell_line, cell_groups in log2_groups.items():
+        for condition, timepoints in cell_groups.items():
+            treatment = condition.strip("_")
+            for timepoint in _sort_timepoints_numeric(timepoints.keys()):
+                data = df[timepoints[timepoint]]
+                enough = data.notna().sum(axis=1) >= min_reps
+                pfx = f"{cell_line}_log2"
+
+                means[f"{pfx}:mean_{treatment}_{timepoint}"] = data.mean(axis=1, skipna=True).where(enough)
+                medians[f"{pfx}:median_{treatment}_{timepoint}"] = data.median(axis=1, skipna=True).where(enough)
+                sds[f"{pfx}:sd_{treatment}_{timepoint}"] = data.std(axis=1, skipna=True).where(enough)
+
+    new_cols = {**means, **medians, **sds}
+    return pd.concat([df.copy(), pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+
+def dia_compute_fold_change(df: pd.DataFrame,
+                            log2_groups: dict,
+                            reference: str = "starve",
+                            verbose: bool = True) -> pd.DataFrame:
+    """
+    Compute log2 fold change relative to the starve timepoint, per cell line × condition.
+
+        log2:FC(timepoint) = log2:mean(timepoint) − log2:mean(starve)
+
+    A site with no abundance detected in starve has no reference to divide by, so its
+    fold change is undefined: the site is skipped and every FC of that cell line ×
+    condition stays NaN for it. This is a per-site, per-cell-line decision — a site can
+    have a usable FC in one cell line and none in another — and the counts are reported
+    so the loss is visible rather than silent. NaN is used rather than 0 on purpose: 0
+    would read as "no change" everywhere downstream.
+
+    log2:FC_{treatment}_starve is computed too and is identically 0 by construction; the
+    rest of the project relies on that structural zero.
+
+    Output column names:
+        {cell_line}_log2:FC_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:mean columns (produced by dia_compute_log2_stats).
+        log2_groups: nested dict returned by dia_compute_log2_abs().
+        reference: timepoint used as the baseline, default 'starve'.
+        verbose: if True, print how many sites were skipped per cell line × condition.
+
+    Returns:
+        Copy of df with the new log2:FC columns appended.
+    """
+    fold_changes = {}
+    skipped = []
+
+    for cell_line, cell_groups in log2_groups.items():
+        for condition, timepoints in cell_groups.items():
+            treatment = condition.strip("_")
+
+            ref_col = f"{cell_line}_log2:mean_{treatment}_{reference}"
+            if ref_col not in df.columns:
+                warnings.warn(f"dia_compute_fold_change: reference column '{ref_col}' not found "
+                              f"— skipping FC for {cell_line} / {treatment}.")
+                continue
+
+            ref = df[ref_col]
+            # Sites with no reference abundance: the subtraction below already leaves
+            # them NaN, this only records how many they are.
+            skipped.append({"cell_line": cell_line,
+                            "condition": treatment,
+                            "n_sites": len(df),
+                            "n_no_starve": int(ref.isna().sum()),
+                            "pct_no_starve": round(ref.isna().sum() / len(df) * 100, 1) if len(df) else 0.0,})
+
+            for timepoint in _sort_timepoints_numeric(timepoints.keys()):
+                mean_col = f"{cell_line}_log2:mean_{treatment}_{timepoint}"
+                if mean_col not in df.columns:
+                    continue
+                fold_changes[f"{cell_line}_log2:FC_{treatment}_{timepoint}"] = df[mean_col] - ref
+
+    if verbose and skipped:
+        print(f"Sites without a '{reference}' reference (log2:FC left as NaN):")
+        for row in skipped:
+            print(f"  {row['cell_line']:<14} {row['condition']:<10} "
+                  f"{row['n_no_starve']:>7} / {row['n_sites']} ({row['pct_no_starve']:.1f}%)")
+
+    return pd.concat([df.copy(), pd.DataFrame(fold_changes, index=df.index)], axis=1)
+
+
+def _dia_fc_columns(df: pd.DataFrame,
+                    cell_line: str,
+                    timepoints: dict,
+                    treatment: str,
+                    exclude: tuple) -> tuple:
+    """
+    List the log2:FC columns of one cell line × condition, split into all columns and
+    the subset that may define a normalisation basis.
+
+    Args:
+        df: DataFrame holding the log2:FC columns.
+        cell_line: cell-line prefix, e.g. 'BRAFS151A1'.
+        timepoints: {timepoint: [log2:abs columns]} for this cell line × condition,
+            i.e. one leaf of the dict returned by dia_compute_log2_abs().
+        treatment: condition label without delimiters, e.g. 'EGF'.
+        exclude: timepoint labels kept out of the basis, e.g. ('full', 'starve').
+
+    Returns:
+        Tuple (all_cols, basis_cols) of column names in experimental order; basis_cols
+        is all_cols minus the excluded timepoints. Columns absent from df are dropped
+        from both.
+    """
+    all_cols, basis_cols = [], []
+    for timepoint in _sort_timepoints_numeric(timepoints.keys()):
+        col = f"{cell_line}_log2:FC_{treatment}_{timepoint}"
+        if col not in df.columns:
+            continue
+        all_cols.append(col)
+        if str(timepoint) not in exclude:
+            basis_cols.append(col)
+    return all_cols, basis_cols
+
+
+def dia_compute_scaled_fc(df: pd.DataFrame,
+                          log2_groups: dict,
+                          exclude_from_scale: tuple = ("full",),
+                          verbose: bool = True) -> pd.DataFrame:
+    """
+    Scale the fold changes of each site so its largest stimulation response is ±1.
+
+        log2:scaled(condition, timepoint) = log2:FC(condition, timepoint) / max(|log2:FC|)
+
+    The denominator is taken per site **per cell line, jointly across that cell line's
+    conditions**, so the relative amplitude between conditions is preserved (an INS arm
+    that responds half as strongly as the EGF arm still reads as half). Only the
+    timepoints outside `exclude_from_scale` enter the maximum.
+
+    Why `full` is excluded by default: cells in full media are a different media state,
+    not a response to the stimulation, and their |log2:FC| vs starve is routinely the
+    largest value in the row. Including it makes the denominator "how different is full
+    media from starvation", which squashes the actual response towards zero. The
+    log2:scaled column for `full` is still written — it is simply allowed to exceed 1.
+
+    Sites whose basis is all-NaN, or flat at exactly 0, give NaN rather than an infinite
+    scale factor.
+
+    Output column names:
+        {cell_line}_log2:scaled_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:FC columns (produced by dia_compute_fold_change).
+        log2_groups: nested dict returned by dia_compute_log2_abs().
+        exclude_from_scale: timepoint labels kept out of the maximum, default ('full',).
+            Pass () to use every timepoint, i.e. the compute_scaled_fc behaviour.
+        verbose: if True, print per cell line how many sites got a usable scale factor.
+
+    Returns:
+        Copy of df with the new log2:scaled columns appended.
+    """
+    scaled_cols = {}
+    report = []
+
+    for cell_line, cell_groups in log2_groups.items():
+        all_cols, basis_cols = [], []
+        for condition, timepoints in cell_groups.items():
+            cond_all, cond_basis = _dia_fc_columns(df,
+                                                   cell_line=cell_line,
+                                                   timepoints=timepoints,
+                                                   treatment=condition.strip("_"),
+                                                   exclude=tuple(exclude_from_scale),)
+            all_cols.extend(cond_all)
+            basis_cols.extend(cond_basis)
+
+        if not all_cols:
+            warnings.warn(f"dia_compute_scaled_fc: no log2:FC columns found for "
+                          f"cell_line='{cell_line}' — skipped.")
+            continue
+        if not basis_cols:
+            warnings.warn(f"dia_compute_scaled_fc: every timepoint of '{cell_line}' is in "
+                          f"exclude_from_scale={exclude_from_scale} — skipped.")
+            continue
+
+        # replace(0, nan): a site flat at exactly 0 has no amplitude to scale by.
+        max_abs_fc = df[basis_cols].abs().max(axis=1).replace(0, np.nan)
+
+        for fc_col in all_cols:
+            scaled_cols[fc_col.replace("log2:FC", "log2:scaled")] = df[fc_col] / max_abs_fc
+
+        report.append({"cell_line": cell_line,
+                       "n_scaled": int(max_abs_fc.notna().sum()),
+                       "n_sites": len(df),})
+
+    if verbose and report:
+        print(f"log2:scaled — scale factor from timepoints excluding {tuple(exclude_from_scale)}:")
+        for row in report:
+            print(f"  {row['cell_line']:<14} {row['n_scaled']:>7} / {row['n_sites']} sites scaled")
+
+    return pd.concat([df.copy(), pd.DataFrame(scaled_cols, index=df.index)], axis=1)
+
+
+def dia_compute_zscore_fc(df: pd.DataFrame,
+                          log2_groups: dict,
+                          exclude_from_basis: tuple = ("full", "starve",),
+                          min_timepoints: int = 3,
+                          verbose: bool = True) -> pd.DataFrame:
+    """
+    Standardise each site's temporal profile, separately per cell line × condition.
+
+        log2:zscore(timepoint) = (log2:FC(timepoint) − mean_t) / sd_t
+
+    where mean_t and the population sd (ddof=0) are taken across the **stimulation**
+    timepoints of that condition only — every condition of every cell line standardised
+    independently. This removes amplitude, leaving the SHAPE of the response, which is
+    what profile clustering should see.
+
+    Two timepoints are excluded from the basis by default:
+      - `full`, because full media is a different state rather than a response, and
+        standardising over it makes a quarter of the resulting geometry "how different
+        is this site in full media" (measured on hme1_2, clustering_method_decision.md §1);
+      - `starve`, which is identically 0 in FC space by construction and so contributes
+        a constant, not information.
+    Both columns are still written — they are just expressed in the units the
+    stimulation timepoints define, so log2:zscore at starve reads as "how far the
+    baseline sits below the mean response", in SDs.
+
+    Sites with fewer than `min_timepoints` measured basis timepoints, or a flat basis
+    (sd = 0), give NaN for that cell line × condition. NaN timepoints are skipped when
+    computing the mean and sd.
+
+    Note: z-scoring is invariant to an additive shift, so standardising log2:FC gives the
+    same answer as standardising log2:mean — log2:FC is used because the pipeline already
+    produced it.
+
+    Output column names:
+        {cell_line}_log2:zscore_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:FC columns (produced by dia_compute_fold_change).
+        log2_groups: nested dict returned by dia_compute_log2_abs().
+        exclude_from_basis: timepoint labels kept out of the mean/sd, default
+            ('full', 'starve'). Pass () for the compute_zscore_fc behaviour.
+        min_timepoints: minimum number of non-NaN basis timepoints required, default 3.
+            A sd over 1–2 points is not a shape, and the z-scores it produces are ±1 by
+            construction rather than by biology.
+        verbose: if True, print per cell line × condition how many sites were standardised.
+
+    Returns:
+        Copy of df with the new log2:zscore columns appended.
+    """
+    zscore_cols = {}
+    report = []
+
+    for cell_line, cell_groups in log2_groups.items():
+        for condition, timepoints in cell_groups.items():
+            treatment = condition.strip("_")
+            all_cols, basis_cols = _dia_fc_columns(df,
+                                                   cell_line=cell_line,
+                                                   timepoints=timepoints,
+                                                   treatment=treatment,
+                                                   exclude=tuple(exclude_from_basis),)
+
+            if not all_cols:
+                warnings.warn(f"dia_compute_zscore_fc: no log2:FC columns found for "
+                              f"cell_line='{cell_line}', condition='{treatment}' — skipped.")
+                continue
+            if not basis_cols:
+                warnings.warn(f"dia_compute_zscore_fc: every timepoint of '{cell_line}' / "
+                              f"'{treatment}' is in exclude_from_basis={exclude_from_basis} "
+                              f"— skipped.")
+                continue
+
+            basis = df[basis_cols]
+            enough = basis.notna().sum(axis=1) >= min_timepoints
+            row_mean = basis.mean(axis=1).where(enough)
+            row_std = basis.std(axis=1, ddof=0).replace(0, np.nan).where(enough)  # flat -> NaN
+
+            for fc_col in all_cols:
+                zscore_cols[fc_col.replace("log2:FC", "log2:zscore")] = (df[fc_col] - row_mean) / row_std
+
+            report.append({"cell_line": cell_line,
+                           "condition": treatment,
+                           "n_zscored": int(row_std.notna().sum()),
+                           "n_sites": len(df),})
+
+    if verbose and report:
+        print(f"log2:zscore — basis excludes {tuple(exclude_from_basis)}, "
+              f"min_timepoints={min_timepoints}:")
+        for row in report:
+            print(f"  {row['cell_line']:<14} {row['condition']:<10} "
+                  f"{row['n_zscored']:>7} / {row['n_sites']} sites standardised")
+
+    return pd.concat([df.copy(), pd.DataFrame(zscore_cols, index=df.index)], axis=1)
+
+
+def run_diapasef_transformations(df: pd.DataFrame,
+                                 cell_lines: list = None,
+                                 conditions: list = None,
+                                 data_type: str = "raw:abs",
+                                 min_reps: int = 1,
+                                 reference: str = "starve",
+                                 exclude_from_scale: tuple = ("full",),
+                                 exclude_from_zscore_basis: tuple = ("full", "starve",),
+                                 min_zscore_timepoints: int = 3,
+                                 verbose: bool = True) -> pd.DataFrame:
+    """
+    Run the diaPASEF transformation chain on all cell lines at once.
+
+    Transformations applied, in order:
+        1. raw:mean, raw:median, raw:sd, raw:cv   (zeros treated as missing)
+        2. log2:abs                               (per replicate, zeros treated as NaN)
+        3. log2:mean, log2:median, log2:sd
+        4. log2:FC                                (vs starve; no starve -> site skipped, NaN)
+        5. log2:scaled                            (amplitude, per cell line across conditions)
+        6. log2:zscore                            (shape, per cell line per condition)
+
+    Steps 5 and 6 normalise the same log2:FC values in two different ways and neither
+    reads the other, so both are written and the downstream analysis picks one — they are
+    alternative representations, not a sequence. Their normalisation basis excludes `full`
+    (and `starve` for the z-score) by default; see dia_compute_scaled_fc /
+    dia_compute_zscore_fc for why, and pass () to reproduce the TMT-side behaviour.
+
+    No differential statistics are computed here — those are done downstream in R/limma.
+
+    Args:
+        df: DataFrame with raw:abs replicate columns following the naming convention.
+        cell_lines: list of cell-line prefixes; None (default) auto-detects all of them.
+        conditions: list of condition substrings, e.g. ['_EGF_']; None auto-detects.
+        data_type: DataType field of the input columns, default 'raw:abs'.
+        min_reps: minimum detected replicates for a statistic to be reported, default 1.
+        reference: baseline timepoint for the fold change, default 'starve'.
+        exclude_from_scale: timepoints kept out of the log2:scaled denominator,
+            default ('full',).
+        exclude_from_zscore_basis: timepoints kept out of the log2:zscore mean/sd,
+            default ('full', 'starve').
+        min_zscore_timepoints: minimum non-NaN basis timepoints for a z-score, default 3.
+        verbose: if True, print the per-step column counts and the FC skip report.
+
+    Returns:
+        Transformed DataFrame with all new columns appended. The input is not modified.
+    """
+    groups = dia_parse_groups(df,
+                              cell_lines=cell_lines,
+                              conditions=conditions,
+                              data_type=data_type,)
+    if not groups:
+        raise ValueError(f"run_diapasef_transformations: no '{data_type}' replicate columns found.")
+
+    if verbose:
+        n_groups = sum(len(tps) for cg in groups.values() for tps in cg.values())
+        print(f"Found {len(groups)} cell lines, "
+              f"{n_groups} (cell line, condition, timepoint) groups.")
+
+    n_before = df.shape[1]
+
+    result = dia_compute_raw_stats(df, groups, min_reps=min_reps,)
+    result, log2_groups = dia_compute_log2_abs(result, groups,)
+    result = dia_compute_log2_stats(result, log2_groups, min_reps=min_reps,)
+    result = dia_compute_fold_change(result, log2_groups, reference=reference, verbose=verbose,)
+    result = dia_compute_scaled_fc(result,
+                                   log2_groups,
+                                   exclude_from_scale=exclude_from_scale,
+                                   verbose=verbose,)
+    result = dia_compute_zscore_fc(result,
+                                   log2_groups,
+                                   exclude_from_basis=exclude_from_zscore_basis,
+                                   min_timepoints=min_zscore_timepoints,
+                                   verbose=verbose,)
+
+    if verbose:
+        print(f"\nDone. Columns: {n_before} -> {result.shape[1]} "
+              f"(+{result.shape[1] - n_before})")
+
+    return result
+
+
 #----------------------
 # Merging PhosphoSitePlus data
 #----------------------
@@ -878,8 +1621,7 @@ def merge_limma_results(df: pd.DataFrame,
     """
     Merge the limma statistics table into a transformed dataset.
 
-    The statistics themselves are computed in R by
-    notebooks/01_preprocessing/limma_for_pvalues.rmd, which writes one
+    The statistics themselves are computed in R, which writes one
     {dataset}_limma_pvalues.tsv per dataset keyed by `site`. This function joins that
     table back onto the Python frame so the rest of the pipeline can use the p-values.
 
@@ -908,13 +1650,11 @@ def merge_limma_results(df: pd.DataFrame,
 
     if limma_df[key].duplicated().any():
         raise ValueError(
-            f"merge_limma_results: '{key}' is not unique in '{limma_path}' — "
-            f"the join would duplicate rows."
+            f"merge_limma_results: '{key}' is not unique in '{limma_path}' — the join would duplicate rows."
         )
     if df[key].duplicated().any():
         warnings.warn(
-            f"merge_limma_results: '{key}' is not unique in the dataset — "
-            f"limma statistics will be repeated across the duplicated rows."
+            f"merge_limma_results: '{key}' is not unique in the dataset — limma statistics will be repeated across the duplicated rows."
         )
 
     stat_cols = [col for col in limma_df.columns if col != key]
@@ -935,8 +1675,7 @@ def merge_limma_results(df: pd.DataFrame,
               f"({len(result) - matched} not tested by limma)")
         if unmatched_in_limma:
             warnings.warn(
-                f"merge_limma_results: {unmatched_in_limma} site(s) in '{limma_path}' "
-                f"are absent from the dataset and were discarded by the left join."
+                f"merge_limma_results: {unmatched_in_limma} site(s) in '{limma_path}' are absent from the dataset and were discarded by the left join."
             )
 
     return result
