@@ -779,32 +779,74 @@ def combine_conditions(scores_per_cluster,
     return combined
 
 def compute_centroid_linkage(centers,
-                             method="weighted",):
+                             method="weighted",
+                             metric="euclidean",):
     """
-    Compute pairwise DTW distances between KMeans cluster centers and
-    run hierarchical clustering on those distances.
+    Hierarchically cluster the KMeans cluster centroids that have already been computed.
 
     Takes the cluster_centers_ array from a fitted TimeSeriesKMeans model
-    (shape: n_clusters × n_timepoints × n_conditions) and returns a linkage
-    matrix that can be passed directly to scipy dendrogram or
-    plot_cluster_hierarchy().
+    (shape: n_clusters × n_timepoints × n_conditions), computes the pairwise distance
+    between centroids, and returns a linkage matrix that can be passed straight to
+    scipy dendrogram or plot_cluster_hierarchy(). This is the cheap "coarse-to-fine"
+    view: KMeans decides the partition, the tree only imposes an order on the k
+    centroids, so nothing is re-clustered at site level.
+
+    WHY EUCLIDEAN IS THE DEFAULT (it used to be DTW). Two independent reasons, both from
+    `notebooks/03_clustering/clustering_method_decision.md`:
+
+      1. All sites share the same fixed timepoints, so the series are already aligned.
+         DTW then buys nothing — worse, it *warps time*, and in this experiment the
+         timing of the response IS the signal being measured. Two centroids that peak at
+         2 min and at 15 min are biologically different; DTW is designed to call them
+         similar.
+      2. DTW is not a metric (it violates the triangle inequality), so 'ward',
+         'centroid' and 'median' linkage are mathematically undefined on a DTW distance
+         matrix — scipy will still return a number, which is worse than an error.
+
+    Euclidean on the flattened centroid also matches the objective KMeans itself
+    minimised, so the tree and the partition are measuring the same thing.
 
     Args:
         centers: np.ndarray of shape (n_clusters, n_timepoints, n_conditions) —
                  the cluster_centers_ attribute of a fitted TimeSeriesKMeans model.
+                 A 2-D (n_clusters, n_timepoints) array is accepted as the
+                 single-condition case.
         method: linkage method passed to scipy.cluster.hierarchy.linkage.
                 Options: 'single', 'complete', 'average', 'weighted' (default),
                 'centroid', 'median', 'ward'.
+        metric: 'euclidean' (default) or 'dtw'. Only use 'dtw' with a linkage method
+                that does not assume a metric space ('single', 'complete', 'average',
+                'weighted'), and only with a reason to warp time.
 
     Returns:
         Z: np.ndarray — linkage matrix of shape (n_clusters-1, 4), as returned
            by scipy.cluster.hierarchy.linkage.
-        dist_matrix: np.ndarray of shape (n_clusters, n_clusters) — full
-                     pairwise DTW distance matrix between cluster centers.
+        dist_matrix: np.ndarray of shape (n_clusters, n_clusters) — full pairwise
+                     distance matrix between cluster centroids.
     """
-    dist_matrix = cdist_dtw(centers)
-    condensed   = squareform(dist_matrix)
-    Z           = linkage(condensed, method=method)
+    centers = np.asarray(centers)
+    if centers.ndim == 2:
+        centers = centers[:, :, None]
+
+    if metric == "dtw":
+        if method in ("ward", "centroid", "median",):
+            warnings.warn(f"compute_centroid_linkage: linkage method '{method}' assumes a "
+                          f"Euclidean metric space, but DTW is not a metric (it violates the "
+                          f"triangle inequality). The result is not well defined. Use "
+                          f"metric='euclidean' or a method in "
+                          f"('single', 'complete', 'average', 'weighted').")
+        dist_matrix = cdist_dtw(centers)
+    elif metric == "euclidean":
+        # Flatten (timepoints × conditions) per centroid; Euclidean on the flattened
+        # vector is exactly the multivariate Euclidean distance between the centroids.
+        flat = centers.reshape(centers.shape[0], -1,)
+        dist_matrix = squareform(pdist(flat, metric="euclidean",))
+    else:
+        raise ValueError(f"compute_centroid_linkage: unknown metric '{metric}' "
+                         f"(expected 'euclidean' or 'dtw').")
+
+    condensed = squareform(dist_matrix)
+    Z         = linkage(condensed, method=method)
     return Z, dist_matrix
 
 
