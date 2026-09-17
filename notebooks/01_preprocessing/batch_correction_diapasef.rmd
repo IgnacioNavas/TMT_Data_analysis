@@ -1,0 +1,1040 @@
+---
+title: "Batch correction (diaPASEF) — removeBatchEffect for clustering, PCA and curve plots"
+output: html_notebook
+---
+
+# Purpose
+
+Produce a **batch-corrected intensity matrix** for the `hme1_lfq` / `hme1_diaPASEF` dataset, to be
+consumed by the downstream Python clustering, PCA and visualisation code.
+
+The 219 injections were acquired in **three enrichment + LC batches**. Each batch carries an overall
+additive offset — the whole run sits a little higher or lower on the log2 scale than its neighbours —
+and that offset is a technical artefact of when the samples were enriched and injected, not biology.
+Left in, it becomes one of the largest directions of variance in the matrix, which means PC1 of a PCA
+and the first split of any clustering can be *"which batch was this run in"* rather than *"how does
+this site respond to EGF"*.
+
+This notebook removes that offset with `limma::removeBatchEffect`, and validates the removal against
+the three pooled reference injections.
+
+> This notebook and `notebooks/01_preprocessing/batch_correction_diapasef.R` are the two drivers
+> of the same analysis — the `.R` for `Rscript` / cron use, this one for reading the diagnostics
+> as they are produced. **They now share one implementation** (`src/batch_correction_diapasef.R`),
+> so the helper functions can no longer drift apart.
+>
+> ⚠️ They are **not** configured the same, and as of 2026-09-14 they are not equivalent:
+>
+> | | this notebook | the `.R` script |
+> |---|---|---|
+> | `OUTPUT_SCALE` | `"linear"` | `"log2"` |
+> | suffixes | `_batchcorrected_linear*` | `_batchcorrected*` |
+> | what is written | **all** injections, references included, in input-file column order | biological samples only; the references are held out |
+> | paths | from `PROJECT_ROOT` | from `PROJECT_ROOT`, overridable by command-line arguments |
+>
+> The write-out difference is a real behavioural difference, not a setting — decide which one
+> is wanted and make the other match.
+
+# The two tracks: subtract for the eyes, adjust for the test
+
+There are two legitimate ways to deal with an additive batch offset, and this project uses **both** —
+for different consumers, on different matrices. Getting them mixed up is the single most likely way
+to misuse this notebook's output, so it is stated first.
+
+| | ADJUST for the test | SUBTRACT for the eyes |
+|---|---|---|
+| where | `limma_for_pvalues_diapasef.rmd` | **this notebook** |
+| data fitted | the **uncorrected** values | — |
+| how batch is handled | a term in the design matrix, `~ ... + batch` | subtracted from the data up front |
+| consumers | p-values, FDR, responsiveness filters | clustering, PCA, UMAP, profile and curve plots |
+
+**Why the split.** limma has a design matrix to put a nuisance term into, so it can estimate the
+batch offsets *jointly* with the biology and charge the degrees of freedom for having done so — the
+residual df, the moderated variance and therefore the p-values all stay correct. Clustering and PCA
+have no design matrix. They see whatever numbers they are handed, so for them the offset has to be
+gone from the numbers themselves.
+
+⚠ **The matrix this notebook writes must never be fed into limma, or into any other inference step.**
+Its batch degrees of freedom have already been spent, but a model fitted on it does not know that, so
+it would treat corrected residuals as if they were free — anti-conservative p-values. If the
+inference needs changing, that is a deliberate change to the limma notebook, not a change of input
+file.
+
+# Why `removeBatchEffect`, and why location-only
+
+- **Same model as the inference.** `removeBatchEffect` removes exactly the additive batch term that
+  `~ ... + batch` estimates. The matrix we cluster and the matrix we test then differ only in *where*
+  the batch term was accounted for, not in *what the batch term is*. ComBat/sva would fit a different
+  model (empirical-Bayes, and for ComBat also multiplicative), so the picture and the statistics
+  would start telling slightly different stories about the same data.
+- **The effect we have evidence for is a shift.** An enrichment-run + LC-session difference moves the
+  whole run up or down; that is a location effect. A scale or variance correction would be fitting
+  something we have not observed, and on DIA data with per-run missingness a per-batch *variance*
+  estimate is exactly the kind of quantity that is dominated by which sites happened to be quantified
+  rather than by any real dispersion difference.
+- **`batch` is a plain fixed effect with 3 levels.** Three levels is far too few for empirical-Bayes
+  shrinkage of the batch term to mean anything. A plain fixed term gets the bookkeeping right, and
+  nothing is gained by being clever.
+- **`design` carries the biology**, which is what tells `removeBatchEffect` what to leave alone
+  (see *The model* below).
+
+# What is deliberately not done
+
+- **No normalisation** — no median centring, no quantile normalisation, no scaling. The `_None`
+  unnormalised FragPipe variant is the deliberate input; between-sample scaling is a separate
+  decision that is still open on this dataset (`NORMALIZE` in the limma notebook) and must not be
+  smuggled in here.
+- **No zero-filling, no imputation.** Missing intensities stay `NA` from load to write (project
+  rule). Zeros would corrupt the linear fit and destroy the reference CVs — a zero is a
+  non-detection, not a measurement of nothing.
+- **No injection-order term.** Order was randomised within each batch, so LC drift is orthogonal to
+  the biology: it does not bias any contrast, it only inflates within-batch variance. Adding the term
+  would spend degrees of freedom to buy nothing, and on sparse DIA sites it would start fitting the
+  missingness pattern. A disabled hook is left in the model chunk; wire it in **only if** a QC plot
+  of total phospho-signal against injection order shows clear within-batch monotonic drift.
+- **The pooled references are never clustered or tested.** They are held out for QC and dropped from
+  the written matrix.
+
+# Inputs
+
+**Input 1 — the filtered abundance matrix.** The single-site diaPASEF table *after* the project's
+standard filtering (`n:reps`, contaminants CON/REV, localization, incomplete time series), sites in
+rows, one column per injection plus the usual annotation columns.
+
+**Input 2 — the sample sheet**, one row per injection, written by
+`notebooks/01_preprocessing/LFQ_diaPASEF_batch_effect_correction.ipynb`:
+
+| column | notes |
+|---|---|
+| `sample_id` | **must match the abundance-matrix column header exactly** — this is the join key |
+| `cell_line` | BRAF biological replicates 1 and 2 are **distinct** levels (`BRAFS151A1`, `BRAFS151A2`) |
+| `condition` | includes the controls (`full`, `starve`) as their own levels |
+| `timepoint` | numeric minutes; controls are `NA` or 0 |
+| `batch` | `1` / `2` / `3` — the only factor that gets removed |
+| `is_reference` | `TRUE` for the pooled references (`mix`, `mixb`, `mixc`), else `FALSE` |
+| `injection_order` | optional; **not used** unless the disabled drift hook is turned on |
+
+The generating notebook writes the id column as `sample_Id`; the specification calls it `sample_id`.
+`canonicalise_sheet()` accepts either spelling and normalises it, so neither file has to change.
+
+**Sample columns are identified only by joining the header against `sample_id`** — never by
+string-pattern matching on column names. Anything that does not join is treated as an annotation
+column, and a *numeric* column that fails to join is a hard error (it is almost always an injection
+missing from the sheet, which would otherwise silently escape correction).
+
+```{r setup}
+# ── Helper functions ────────────────────────────────────────────────────────────────────
+# They live in src/ so this notebook and its sibling script
+# notebooks/01_preprocessing/batch_correction_diapasef.R share ONE implementation — before the
+# move the two carried their own copies and had already drifted apart. src/ has to be found
+# before find_project_root() is available (it is defined in r_utils.R), hence the candidate
+# loop: knitting runs with this file's folder as the working directory, running the chunks
+# from the IDE console runs with the project root, and one relative path cannot mean both.
+
+SRC_DIR <- NULL
+for (candidate in c("src", file.path("..", "..", "src"))) {
+  if (file.exists(file.path(candidate, "r_utils.R"))) {
+    SRC_DIR <- normalizePath(candidate)
+    break
+  }
+}
+if (is.null(SRC_DIR)) {
+  stop("setup: cannot find src/ from '", getwd(),
+       "'. Set the working directory to the project root or to notebooks/01_preprocessing/.")
+}
+source(file.path(SRC_DIR, "r_utils.R"))                    # find_project_root, say
+source(file.path(SRC_DIR, "batch_correction_diapasef.R"))  # output_path, read_tsv, ...
+
+PROJECT_ROOT <- find_project_root()
+
+# --- inputs ---------------------------------------------------------------------------
+# Input 1: the filtered single-site diaPASEF abundance matrix. Deliberately the
+#          UNNORMALISED `_None` variant — do not swap it for `_Norm`.
+ABUNDANCE_FILE <- file.path(PROJECT_ROOT, "Experiment", "hme1_diaPASEF", "Data", "Processed",
+                            "20260821_peptide_MS2quant_None_renamed.tsv")
+
+# Input 2: the sample sheet, one row per injection.
+SAMPLE_SHEET_FILE <- file.path(PROJECT_ROOT, "Experiment", "hme1_diaPASEF", "Data",
+                               "batch_info.tsv")
+
+# --- outputs --------------------------------------------------------------------------
+# Default: next to the abundance file. The suffixes guarantee the input is never the output.
+OUT_DIR <- dirname(ABUNDANCE_FILE)
+
+# The suffixes carry OUTPUT_SCALE, so the log2 and linear runs cannot collide and neither
+# can overwrite the other. The reference QC is computed on the log2 matrix and is therefore
+# IDENTICAL between the two runs — the scale token in its name is for pairing, not content.
+OUT_SUFFIX_MATRIX  <- "_batchcorrected_linear.tsv"        # the clustering matrix (references dropped)
+OUT_SUFFIX_REF_QC  <- "_batchcorrected_linear_refQC.tsv"  # per-site reference spread, before vs after
+OUT_SUFFIX_REF_PNG <- "_batchcorrected_linear_refQC.png"  # before/after diagnostic figure
+
+# Refuse to clobber anything that already exists (project rule: never overwrite).
+OVERWRITE <- FALSE
+
+# --- sample sheet schema --------------------------------------------------------------
+# Both id spellings are accepted; whichever is present is canonicalised to `sample_id`.
+ID_COLUMN_CANDIDATES <- c("sample_id", "sample_Id", "sample_ID", "sampleId")
+
+REQUIRED_SHEET_COLUMNS <- c("cell_line", "condition", "timepoint", "batch", "is_reference")
+
+# --- scale detection ------------------------------------------------------------------
+# removeBatchEffect operates on log-scale data. Real log2 phospho intensities live in
+# roughly [5, 35]; linear detector intensities run to 1e5-1e9. Anything above this
+# threshold is therefore unambiguously linear and gets log2-transformed exactly once.
+LOG2_MAX_PLAUSIBLE <- 64
+
+# --- output scale ---------------------------------------------------------------------
+# "log2"   -> write the corrected values on the log2 scale the correction was done on, and
+#             rename the DataType token of every sample column `raw:abs` -> `log2:abs`, so
+#             the header does not claim to hold linear intensities that it does not.
+# "linear" -> back-transform with 2^x so the file can be fed straight into
+#             `run_diapasef_transformations()` in src/transformations.py, which expects
+#             `raw:abs` linear intensities and does its own log2.
+# The correction happens on log2 either way; this only chooses what is written to disk.
+#
+# NOTE on "linear": 2^x is the corrected value back on a linear scale, NOT the original
+# measurement. Each cell has been multiplied by a per-(site, batch) factor — that is the
+# whole point of the correction. The column keeps the `raw:abs` DataType token because the
+# SCALE is genuinely linear, but the numbers are no longer "as measured by the detector".
+# Feeding them to run_diapasef_transformations() is exact, not approximate: that function
+# takes log2 immediately, and log2(2^x) == x to floating-point precision.
+OUTPUT_SCALE <- "linear"
+
+RENAME_DATA_TYPE <- c(from = "raw:abs", to = "log2:abs")
+
+# --- annotation columns that are legitimately numeric ---------------------------------
+# Used ONLY by the safety check in split_matrix_columns(): a numeric column that is neither
+# a known sample nor listed here is almost certainly an injection missing from the sheet.
+NUMERIC_ANNOTATION_COLUMNS <- c("Index", "peptide_index", "Start", "End", "Peptide Length",
+                                "Probability", "Multiplicity", "Precursor Count",
+                                "Best Localization", "Best Scan for Localization",
+                                "protein_length", "nrPeptides", "nr_tryptic_peptides",
+                                "NumPhos", "LocalizedNumPhos", "MaxPepProb", "AScore",
+                                "n:reps", "ReferenceIntensity", "startModSite", "endModSite")
+
+# --- switches -------------------------------------------------------------------------
+# Injection-order drift hook — see the disabled block in the model chunk. Leave FALSE.
+USE_INJECTION_ORDER <- FALSE
+
+# Re-fit the same linear model once more, purely to count how many sites had a batch
+# coefficient that could not be estimated. Costs one extra lmFit over the whole matrix;
+# set FALSE to skip it on a very large file.
+REPORT_NONESTIMABLE <- TRUE
+
+VERBOSE <- TRUE
+options(tmt.verbose = VERBOSE)   # read by say() in src/r_utils.R
+```
+
+# Helper functions
+
+Every function below is pure except `say()` (prints) and `plot_reference_qc()` (draws). The
+correction itself is a single call to `limma::removeBatchEffect` in the *Correct* chunk — nothing
+here re-implements it.
+
+Every helper lives in **`src/batch_correction_diapasef.R`**, sourced by the `setup` chunk
+(`say()` and `find_project_root()` come from **`src/r_utils.R`**, shared with the limma and
+Trendy notebooks). The **same file is sourced by the sibling script**
+`notebooks/01_preprocessing/batch_correction_diapasef.R`, so the two drivers can no longer
+drift apart — only their configuration differs.
+
+| function | what it does |
+|---|---|
+| `output_path` | input stem + descriptive suffix; refuses to overwrite |
+| `read_tsv` | project TSV reader — `check.names = FALSE`, missing values stay `NA` |
+| `canonicalise_sheet` | validate the sample sheet, normalise the id spelling and the types |
+| `split_matrix_columns` | sample vs annotation columns, by joining the header against `sample_id` |
+| `to_log2_if_needed` | put the matrix on the log2 scale exactly once |
+| `build_bio_group` | the biological factor the correction must protect |
+| `check_batch_orthogonality` | is every biological group present in every batch? |
+| `count_nonestimable` | per site, how many batch coefficients limma could not estimate |
+| `reference_spread` | per-site SD / CV across the pooled references |
+| `plot_reference_qc` | the before/after diagnostic figure |
+
+Every function is pure except `say()` (prints) and `plot_reference_qc()` (draws). The correction
+itself is a single call to `limma::removeBatchEffect` in the *Correct* chunk — nothing in the
+module re-implements it.
+
+⚠️ Arguments that used to default to a notebook global (`OUT_DIR`, `OVERWRITE`,
+`ID_COLUMN_CANDIDATES`, `REQUIRED_SHEET_COLUMNS`, `NUMERIC_ANNOTATION_COLUMNS`,
+`LOG2_MAX_PLAUSIBLE`, `VERBOSE`) are now explicit arguments with literal defaults, and the
+chunks below pass the configuration in. A sourced file must not silently depend on variables
+defined by whoever sourced it. ⚠️ `read_tsv()` shadows `readr::read_tsv` — do not attach readr
+in a session that sources the module.
+
+The originals are kept below, commented out, for comparison. The chunk is never evaluated and
+never rendered.
+
+```{r functions-moved-to-src, eval=FALSE, include=FALSE}
+# ─────────────────────────────────────────────────────────────────────────────────────
+# MOVED to src/batch_correction_diapasef.R (and say() to src/r_utils.R).
+# Kept commented out so the two versions can be compared.
+# ─────────────────────────────────────────────────────────────────────────────────────
+# say <- function(...) {
+#   # Print a progress line, honouring the VERBOSE switch.
+#   #
+#   # Args:
+#   #   ...: objects pasted together to form the message.
+#   #
+#   # Returns:
+#   #   NULL, invisibly. Called for the side effect of writing to stdout.
+#
+#   if (VERBOSE) cat(..., "\n", sep = "")
+#   invisible(NULL)
+# }
+#
+#
+# output_path <- function(input_path,
+#                         suffix,
+#                         out_dir = OUT_DIR) {
+#   # Build an output path from the input filename plus a descriptive suffix.
+#   #
+#   # The input extension is stripped and the suffix appended, so the input file can never be
+#   # the output file. Stops if the target exists and OVERWRITE is FALSE (project rule: never
+#   # overwrite a processed data file, always version the name).
+#   #
+#   # Args:
+#   #   input_path: path of the abundance matrix the output is derived from.
+#   #   suffix: string appended to the input stem, including its own extension.
+#   #   out_dir: directory to write into.
+#   #
+#   # Returns:
+#   #   Absolute path of the file to write.
+#
+#   stem <- sub("\\.[A-Za-z0-9]+$", "", basename(input_path))
+#   path <- file.path(out_dir, paste0(stem, suffix))
+#
+#   if (file.exists(path) && !OVERWRITE) {
+#     stop("output_path: '", path, "' already exists and OVERWRITE is FALSE. ",
+#          "Move it aside or add a version tag to the suffix.")
+#   }
+#   if (normalizePath(path, mustWork = FALSE) == normalizePath(input_path, mustWork = FALSE)) {
+#     stop("output_path: refusing to write over the input file '", input_path, "'.")
+#   }
+#   path
+# }
+#
+#
+# read_tsv <- function(path,
+#                      what) {
+#   # Read a project TSV, keeping column names verbatim and missing values as NA.
+#   #
+#   # `check.names = FALSE` is essential: the sample column names contain ':' and the header
+#   # would otherwise be mangled into `WT_raw.abs_EGF_full_r1`, breaking the join against the
+#   # sample sheet. Empty strings and the usual sentinels become NA — nothing is ever
+#   # zero-filled (project rule).
+#   #
+#   # Args:
+#   #   path: file to read.
+#   #   what: short human-readable description used in error messages.
+#   #
+#   # Returns:
+#   #   A data.frame with the file's columns in file order.
+#
+#   if (!file.exists(path)) {
+#     stop("read_tsv: ", what, " not found at '", path, "'.")
+#   }
+#   df <- utils::read.delim(path,
+#                           sep = "\t",
+#                           header = TRUE,
+#                           check.names = FALSE,
+#                           stringsAsFactors = FALSE,
+#                           na.strings = c("", "NA", "NaN", "nan", "None"))
+#   say("  loaded ", what, ": ", nrow(df), " rows x ", ncol(df), " columns")
+#   df
+# }
+#
+#
+# canonicalise_sheet <- function(sheet) {
+#   # Validate the sample sheet and normalise its column names and types.
+#   #
+#   # Renames whichever id spelling is present to `sample_id`, checks the required columns
+#   # exist, coerces `is_reference` from R logicals / "TRUE"/"FALSE" / 0/1 to a logical
+#   # vector, and forces `batch` to a factor. Stops loudly on anything missing or ambiguous
+#   # rather than guessing.
+#   #
+#   # Args:
+#   #   sheet: data.frame as read from the sample-sheet TSV.
+#   #
+#   # Returns:
+#   #   The same data.frame with `sample_id` (character), `batch` (factor), `is_reference`
+#   #   (logical), and the remaining required columns present.
+#
+#   id_present <- intersect(ID_COLUMN_CANDIDATES, colnames(sheet))
+#   if (length(id_present) == 0L) {
+#     stop("canonicalise_sheet: the sample sheet has no id column. Expected one of: ",
+#          paste(ID_COLUMN_CANDIDATES, collapse = ", "),
+#          ". Found: ", paste(colnames(sheet), collapse = ", "))
+#   }
+#   if (length(id_present) > 1L) {
+#     stop("canonicalise_sheet: the sample sheet has more than one id column (",
+#          paste(id_present, collapse = ", "), "). Keep exactly one.")
+#   }
+#   colnames(sheet)[colnames(sheet) == id_present[[1L]]] <- "sample_id"
+#
+#   missing_cols <- setdiff(REQUIRED_SHEET_COLUMNS, colnames(sheet))
+#   if (length(missing_cols) > 0L) {
+#     stop("canonicalise_sheet: sample sheet is missing required column(s): ",
+#          paste(missing_cols, collapse = ", "))
+#   }
+#
+#   sheet$sample_id <- as.character(sheet$sample_id)
+#   if (anyDuplicated(sheet$sample_id) > 0L) {
+#     dups <- unique(sheet$sample_id[duplicated(sheet$sample_id)])
+#     stop("canonicalise_sheet: duplicated sample_id in the sheet: ",
+#          paste(dups, collapse = ", "))
+#   }
+#
+#   # is_reference: accept logical, "TRUE"/"FALSE"/"True"/"true", or 0/1.
+#   ref_raw <- sheet$is_reference
+#   ref <- if (is.logical(ref_raw)) {
+#     ref_raw
+#   } else if (is.numeric(ref_raw)) {
+#     ref_raw != 0
+#   } else {
+#     tolower(trimws(as.character(ref_raw))) %in% c("true", "t", "yes", "1")
+#   }
+#   if (anyNA(ref)) {
+#     stop("canonicalise_sheet: `is_reference` could not be read as a logical for ",
+#          sum(is.na(ref)), " row(s).")
+#   }
+#   sheet$is_reference <- ref
+#
+#   sheet$batch <- factor(as.character(sheet$batch))
+#   if (nlevels(sheet$batch) < 2L) {
+#     stop("canonicalise_sheet: `batch` has ", nlevels(sheet$batch),
+#          " level(s). Nothing to correct — check the sample sheet.")
+#   }
+#
+#   say("  sample sheet: ", nrow(sheet), " injections, ",
+#       nlevels(sheet$batch), " batches (", paste(levels(sheet$batch), collapse = "/"), "), ",
+#       sum(sheet$is_reference), " pooled references")
+#   sheet
+# }
+#
+#
+# split_matrix_columns <- function(abundance,
+#                                  sheet) {
+#   # Split the abundance table into sample columns and annotation columns.
+#   #
+#   # Sample columns are identified ONLY by matching the header against the sheet's
+#   # `sample_id` — never by pattern-matching on the column name. Two failures are fatal: a
+#   # `sample_id` with no matching column, and a numeric column that is in neither the sheet
+#   # nor NUMERIC_ANNOTATION_COLUMNS (which almost always means an injection was left out of
+#   # the sheet and would silently escape correction).
+#   #
+#   # Args:
+#   #   abundance: data.frame as read from the abundance TSV.
+#   #   sheet: canonicalised sample sheet.
+#   #
+#   # Returns:
+#   #   A list with `sample_cols` (character, in sheet order) and `annot_cols` (character, in
+#   #   file order).
+#
+#   sample_cols <- sheet$sample_id
+#   missing_in_matrix <- setdiff(sample_cols, colnames(abundance))
+#   if (length(missing_in_matrix) > 0L) {
+#     stop("split_matrix_columns: ", length(missing_in_matrix),
+#          " sample_id(s) in the sheet have no column in the abundance matrix: ",
+#          paste(utils::head(missing_in_matrix, 20L), collapse = ", "),
+#          if (length(missing_in_matrix) > 20L) " ..." else "")
+#   }
+#
+#   annot_cols <- setdiff(colnames(abundance), sample_cols)
+#
+#   unexplained <- annot_cols[vapply(abundance[annot_cols], is.numeric, logical(1))]
+#   unexplained <- setdiff(unexplained, NUMERIC_ANNOTATION_COLUMNS)
+#   if (length(unexplained) > 0L) {
+#     stop("split_matrix_columns: ", length(unexplained),
+#          " numeric column(s) are neither a sample_id in the sheet nor a known annotation: ",
+#          paste(unexplained, collapse = ", "),
+#          ". If these are injections, add them to the sample sheet; if they are annotations, ",
+#          "add them to NUMERIC_ANNOTATION_COLUMNS.")
+#   }
+#
+#   say("  columns: ", length(sample_cols), " samples, ", length(annot_cols), " annotations")
+#   list(sample_cols = sample_cols, annot_cols = annot_cols)
+# }
+#
+#
+# to_log2_if_needed <- function(x) {
+#   # Put the intensity matrix on the log2 scale, exactly once.
+#   #
+#   # `removeBatchEffect` fits a linear model, so an additive batch offset only *is* additive
+#   # on the log scale. Linear intensities are detected by their range (see
+#   # LOG2_MAX_PLAUSIBLE) and transformed; values that are already log2 are left alone so the
+#   # matrix is never double-logged. Non-positive values become NA, NOT zero — a zero
+#   # intensity in DIA is a non-detection, and log2(0) = -Inf would drag the linear fit. No
+#   # normalisation of any kind is applied.
+#   #
+#   # Args:
+#   #   x: numeric matrix of intensities, injections in columns.
+#   #
+#   # Returns:
+#   #   A list with `x` (the log2-scale matrix) and `was_linear` (logical, which branch ran).
+#
+#   finite_vals <- x[is.finite(x)]
+#   if (length(finite_vals) == 0L) {
+#     stop("to_log2_if_needed: the sample matrix contains no finite values.")
+#   }
+#
+#   rng <- range(finite_vals)
+#   was_linear <- rng[[2L]] > LOG2_MAX_PLAUSIBLE
+#
+#   say("  value range: [", signif(rng[[1L]], 4), ", ", signif(rng[[2L]], 4), "], ",
+#       "median ", signif(stats::median(finite_vals), 4))
+#
+#   if (was_linear) {
+#     say("  scale check -> LINEAR intensities: applying log2 (non-positive -> NA)")
+#     x[!is.na(x) & x <= 0] <- NA_real_
+#     x <- log2(x)
+#   } else {
+#     say("  scale check -> already LOG2: no transformation applied (not double-logging)")
+#     x[!is.finite(x)] <- NA_real_
+#   }
+#
+#   say("  missing values: ", sum(is.na(x)), " / ", length(x),
+#       " (", sprintf("%.1f%%", 100 * mean(is.na(x))), ") — kept as NA, never zero-filled")
+#
+#   list(x = x, was_linear = was_linear)
+# }
+#
+#
+# build_bio_group <- function(sheet) {
+#   # Build the biological factor that the correction must PROTECT.
+#   #
+#   # One level per (cell_line, condition, timepoint) combination — the finest biological unit
+#   # in the experiment, so nothing biological is pooled and therefore nothing biological can
+#   # be absorbed into the batch term. The pooled references are overridden to a single
+#   # "reference" level: they are the same material in all three batches, so giving them their
+#   # own free mean stops that material's overall abundance from being read as a biological
+#   # group, while still letting them ride along and be corrected.
+#   #
+#   # BRAF biological replicates 1 and 2 are distinct `cell_line` levels in the sheet, so they
+#   # stay distinct here — they are not pooled.
+#   #
+#   # Args:
+#   #   sheet: canonicalised sample sheet, rows in the order the matrix columns will be in.
+#   #
+#   # Returns:
+#   #   A factor with one entry per injection, levels made syntactically valid.
+#
+#   grp <- paste(sheet$cell_line, sheet$condition, sheet$timepoint, sep = ".")
+#   grp[sheet$is_reference] <- "reference"
+#   factor(make.names(grp))
+# }
+#
+#
+# check_batch_orthogonality <- function(bio_group,
+#                                       batch) {
+#   # Report how batch and biology are laid out against each other.
+#   #
+#   # The design of this experiment puts every biological group in every batch exactly once,
+#   # which makes `batch` orthogonal to `bio_group`. That is the reason the correction cannot
+#   # erode cell-line / condition / time effects: there is no biological contrast that is even
+#   # partly a batch contrast, so subtracting the batch offsets removes a direction the
+#   # biology does not live in. This function checks that assumption instead of assuming it,
+#   # and warns (rather than stops) if the layout is imperfect — a few groups missing a batch
+#   # is a missingness problem, not a design failure.
+#   #
+#   # Args:
+#   #   bio_group: factor of biological groups, one entry per injection.
+#   #   batch: factor of batches, one entry per injection.
+#   #
+#   # Returns:
+#   #   The group x batch contingency table, invisibly.
+#
+#   tab <- table(bio_group, batch)
+#   balanced <- all(tab == 1L)
+#
+#   if (balanced) {
+#     say("  design: each biological group appears exactly once per batch -> ",
+#         "batch is orthogonal to bio_group; the correction cannot touch the biology")
+#   } else {
+#     n_unbal <- sum(apply(tab, 1L, function(r) length(unique(r)) > 1L))
+#     warning("check_batch_orthogonality: ", n_unbal, " of ", nrow(tab),
+#             " biological groups are not evenly spread across batches. ",
+#             "Batch and biology are partially confounded for those groups; ",
+#             "the correction there is a compromise, not a clean removal.",
+#             call. = FALSE)
+#     say("  design: NOT fully balanced — ", n_unbal, " group(s) unevenly spread over batches")
+#   }
+#
+#   invisible(tab)
+# }
+#
+#
+# count_nonestimable <- function(x,
+#                                design,
+#                                batch) {
+#   # Count, per site, how many batch coefficients could not be estimated.
+#   #
+#   # A site too sparsely quantified in some batch leaves that batch's offset undetermined;
+#   # limma returns NA and `removeBatchEffect` silently substitutes 0, i.e. that part of the
+#   # correction is simply not applied. That is expected under DIA missingness and acceptable
+#   # — but it should be visible rather than silent, which limma's single "Partial NA
+#   # coefficients" warning does not make it (that warning also fires for NA *biological*
+#   # coefficients, which are harmless here, so it cannot be read as a batch diagnostic).
+#   #
+#   # This re-fits the exact model `removeBatchEffect` fits internally (the batch factor in
+#   # sum-to-zero coding, projected onto the orthogonal complement of `design`) purely to read
+#   # the NA pattern out of the coefficients. It does NOT produce the corrected values — those
+#   # come from `removeBatchEffect` itself, so there is one implementation of the correction,
+#   # not two.
+#   #
+#   # Args:
+#   #   x: log2-scale matrix, sites in rows, injections in columns.
+#   #   design: biological design matrix passed to removeBatchEffect.
+#   #   batch: factor of batches, one entry per injection.
+#   #
+#   # Returns:
+#   #   Integer vector, one entry per site: the number of NA batch coefficients (0 = fully
+#   #   corrected, ncol(batch contrasts) = not corrected at all).
+#
+#   b <- as.factor(batch)
+#   stats::contrasts(b) <- stats::contr.sum(levels(b))
+#   batch_mat <- stats::model.matrix(~ b)[, -1L, drop = FALSE]
+#   batch_mat <- qr.resid(qr(design), batch_mat)
+#
+#   fit <- suppressWarnings(limma::lmFit(x, cbind(design, batch_mat)))
+#   beta <- fit$coefficients[, -seq_len(ncol(design)), drop = FALSE]
+#   rowSums(is.na(beta))
+# }
+#
+#
+# reference_spread <- function(x,
+#                              ref_cols) {
+#   # Per-site technical spread across the pooled reference injections.
+#   #
+#   # The references are the same physical material injected once per batch, so every
+#   # difference between them is technical. Only sites quantified in ALL references are
+#   # evaluable — under DIA missingness that is a subset, which is fine: this is a spot-check,
+#   # not a per-site gate.
+#   #
+#   # CV is reported on the log2 scale as sd/|mean| * 100, which is a ratio of log2 units, not
+#   # the linear-scale CV. SD in log2 units is the primary number; the CV column is kept
+#   # because it is scale-free across sites.
+#   #
+#   # Args:
+#   #   x: log2-scale matrix, sites in rows.
+#   #   ref_cols: column names of the reference injections.
+#   #
+#   # Returns:
+#   #   A data.frame with one row per site: `n_obs`, `mean`, `sd`, `cv` (NA where the site is
+#   #   not observed in every reference).
+#
+#   m <- x[, ref_cols, drop = FALSE]
+#   n_obs <- rowSums(!is.na(m))
+#   complete <- n_obs == length(ref_cols)
+#
+#   mu <- rep(NA_real_, nrow(m))
+#   sd <- rep(NA_real_, nrow(m))
+#   mu[complete] <- rowMeans(m[complete, , drop = FALSE])
+#   sd[complete] <- apply(m[complete, , drop = FALSE], 1L, stats::sd)
+#
+#   data.frame(n_obs = n_obs,
+#              mean = mu,
+#              sd = sd,
+#              cv = 100 * sd / abs(mu),
+#              row.names = rownames(m),
+#              stringsAsFactors = FALSE)
+# }
+#
+#
+# plot_reference_qc <- function(before,
+#                               after,
+#                               path = NULL) {
+#   # Draw the before/after reference-spread diagnostic, optionally saving it.
+#   #
+#   # Left: overlaid histograms of per-site SD across the references. Right: scatter of before
+#   # vs after with the identity line — points below the line are sites whose technical spread
+#   # shrank. Success is the whole cloud sitting below the diagonal.
+#   #
+#   # Args:
+#   #   before: data.frame from reference_spread() on the uncorrected values.
+#   #   after: data.frame from reference_spread() on the corrected values.
+#   #   path: PNG file to write; NULL draws to the current device (inline in the notebook).
+#   #
+#   # Returns:
+#   #   `path`, invisibly (NULL when drawing inline).
+#
+#   ok <- !is.na(before$sd) & !is.na(after$sd)
+#   b <- before$sd[ok]
+#   a <- after$sd[ok]
+#
+#   if (!is.null(path)) {
+#     grDevices::png(path, width = 1600, height = 750, res = 140)
+#     on.exit(grDevices::dev.off(), add = TRUE)
+#   }
+#   old_par <- graphics::par(mfrow = c(1L, 2L), mar = c(4.5, 4.5, 3, 1))
+#   on.exit(graphics::par(old_par), add = TRUE)
+#
+#   brks <- graphics::hist(c(b, a), breaks = 40L, plot = FALSE)$breaks
+#   hb <- graphics::hist(b, breaks = brks, plot = FALSE)
+#   ha <- graphics::hist(a, breaks = brks, plot = FALSE)
+#   graphics::plot(hb, col = grDevices::adjustcolor("grey40", 0.6), border = NA,
+#                  ylim = c(0, max(hb$counts, ha$counts)),
+#                  main = "Reference spread per site",
+#                  xlab = "SD across mix / mixb / mixc (log2)", ylab = "sites")
+#   graphics::plot(ha, col = grDevices::adjustcolor("#1f77b4", 0.6), border = NA, add = TRUE)
+#   graphics::abline(v = stats::median(b), col = "grey20", lwd = 2, lty = 2)
+#   graphics::abline(v = stats::median(a), col = "#1f77b4", lwd = 2, lty = 2)
+#   graphics::legend("topright", bty = "n",
+#                    fill = c(grDevices::adjustcolor("grey40", 0.6),
+#                             grDevices::adjustcolor("#1f77b4", 0.6)),
+#                    legend = c(sprintf("before (median %.3f)", stats::median(b)),
+#                               sprintf("after  (median %.3f)", stats::median(a))))
+#
+#   lim <- range(c(b, a), finite = TRUE)
+#   graphics::plot(b, a, pch = 16, cex = 0.35,
+#                  col = grDevices::adjustcolor("black", 0.25),
+#                  xlim = lim, ylim = lim,
+#                  main = sprintf("%.1f%% of sites improved", 100 * mean(a < b)),
+#                  xlab = "SD before (log2)", ylab = "SD after (log2)")
+#   graphics::abline(0, 1, col = "red", lwd = 2)
+#
+#   invisible(path)
+# }
+```
+
+# 1. Load
+
+The two inputs are joined by name and then **ordered identically** — the matrix columns are taken in
+sheet order, so every positional index downstream (`batch[j]`, `bio_group[j]`) refers to the same
+injection as column `j`. This is the single point where the two files are aligned, and it is done by
+name, so it cannot silently mis-pair.
+
+```{r load}
+say("=== 1. Load ===")
+say("  abundance : ", ABUNDANCE_FILE)
+say("  sheet     : ", SAMPLE_SHEET_FILE)
+
+abundance <- read_tsv(ABUNDANCE_FILE, "abundance matrix")
+sheet     <- canonicalise_sheet(read_tsv(SAMPLE_SHEET_FILE, "sample sheet"),
+                                id_candidates    = ID_COLUMN_CANDIDATES,
+                                required_columns = REQUIRED_SHEET_COLUMNS)
+
+cols <- split_matrix_columns(abundance,
+                             sheet,
+                             numeric_annotation_columns = NUMERIC_ANNOTATION_COLUMNS)
+sample_cols <- cols$sample_cols
+annot_cols  <- cols$annot_cols
+
+x <- as.matrix(abundance[, sample_cols, drop = FALSE])
+storage.mode(x) <- "double"
+rownames(x) <- if ("site" %in% annot_cols) abundance[["site"]] else rownames(abundance)
+stopifnot(identical(colnames(x), sheet$sample_id))
+```
+
+# 2. Scale check
+
+`removeBatchEffect` fits a linear model, so an additive batch offset only **is** additive on the log
+scale. The branch taken is printed, and the matrix is never double-logged: if the input is already
+`log2:abs`, nothing happens.
+
+```{r scale-check}
+say("=== 2. Scale check ===")
+scaled <- to_log2_if_needed(x, log2_max_plausible = LOG2_MAX_PLAUSIBLE)
+x <- scaled$x
+```
+
+# 3. The model
+
+Two factors, doing opposite jobs.
+
+**`bio_group` — what to protect.** A single factor with one level per
+`(cell_line, condition, timepoint)` combination, plus `"reference"` for the pooled injections. This
+is the finest biological unit in the experiment: because nothing biological is pooled into a shared
+level, nothing biological can be absorbed into the batch term. Giving the references their own free
+mean stops that pooled material — which is not any cell line at any timepoint — from being read as a
+biological group of its own.
+
+**`batch` — what to remove.** A 3-level fixed factor, unshrunk.
+
+**Why this is safe.** `removeBatchEffect` projects the batch columns onto the orthogonal complement
+of `design` before fitting, so any variance a batch column *shares* with a biological group is
+credited to the biology and left alone. In this experiment each biological group appears exactly once
+per batch, so batch is orthogonal to `bio_group` to begin with — there is no biological contrast that
+is even partly a batch contrast. `check_batch_orthogonality()` verifies that from the sheet rather
+than assuming it, and warns if the layout is not what is claimed here.
+
+```{r model}
+say("=== 3. Model ===")
+
+bio_group <- build_bio_group(sheet)
+batch     <- sheet$batch
+
+say("  bio_group: ", nlevels(bio_group), " levels (incl. 'reference'), ",
+    "batch: ", nlevels(batch), " levels")
+
+check_batch_orthogonality(bio_group, batch)
+
+design <- stats::model.matrix(~ 0 + bio_group)
+colnames(design) <- levels(bio_group)
+
+rank_full <- qr(design)$rank
+if (rank_full < ncol(design)) {
+  stop("model: the biological design matrix is rank deficient (rank ", rank_full,
+       " < ", ncol(design), " columns). Check for empty bio_group levels in the sheet.")
+}
+say("  design: ", nrow(design), " injections x ", ncol(design),
+    " biological coefficients (full rank), plus ", nlevels(batch) - 1L,
+    " batch coefficient(s)")
+
+# ---------------------------------------------------------------------------------------
+# INJECTION ORDER — DISABLED HOOK, do not enable without evidence
+# ---------------------------------------------------------------------------------------
+# Injection order was randomised WITHIN each batch, so LC drift is orthogonal to the
+# biology: it does not bias any contrast, it only inflates within-batch variance. Adding an
+# order term would spend degrees of freedom to buy nothing, and on sparse DIA sites it would
+# start fitting the missingness pattern.
+#
+# Wire this in ONLY IF a QC plot of total phospho-signal vs injection order shows a clear
+# within-batch monotonic drift. It would then go in as a `covariates` term, NOT as a second
+# batch factor:
+#
+# if (USE_INJECTION_ORDER) {
+#   stopifnot("injection_order" %in% colnames(sheet))
+#   # centre within batch so the term captures drift, not a second batch offset
+#   drift <- unlist(lapply(split(sheet$injection_order, sheet$batch),
+#                          function(v) scale(v, center = TRUE, scale = FALSE)))
+#   drift <- drift[order(unlist(split(seq_len(nrow(sheet)), sheet$batch)))]
+#   covariates <- matrix(drift, ncol = 1L, dimnames = list(NULL, "injection_order"))
+# } else {
+#   covariates <- NULL
+# }
+# ---------------------------------------------------------------------------------------
+```
+
+# 4. Correct
+
+One call. `batch` is the axis removed, `design` is what is left alone.
+
+Sites too sparse in a batch to estimate its offset get an `NA` coefficient, which `removeBatchEffect`
+sets to `0` — those sites are simply left uncorrected in that direction. **This is expected under DIA
+missingness and is not an error**; the count is reported so it is visible rather than implied.
+
+Two assertions close the chunk: the correction is location-only, so nothing may appear or disappear.
+The dimensions and the entire missingness pattern must be identical before and after — if either
+changes, something imputed, and the run should be stopped.
+
+```{r correct}
+say("=== 4. removeBatchEffect ===")
+
+corrected <- limma::removeBatchEffect(x,
+                                      batch = batch,
+                                      design = design)
+
+say("  corrected ", nrow(corrected), " sites x ", ncol(corrected), " injections")
+
+n_untouched <- sum(rowSums(abs(corrected - x), na.rm = TRUE) == 0)
+say("  sites left completely unchanged (no batch coefficient estimable): ",
+    n_untouched, " (", sprintf("%.1f%%", 100 * n_untouched / nrow(corrected)), ")")
+
+if (REPORT_NONESTIMABLE) {
+  na_counts <- count_nonestimable(x, design, batch)
+  say("  sites with a non-estimable batch coefficient (NA -> 0, partial correction): ",
+      sum(na_counts > 0), " (", sprintf("%.1f%%", 100 * mean(na_counts > 0)), ")",
+      " — expected under DIA missingness, not an error")
+}
+
+stopifnot(identical(dim(corrected), dim(x)))
+stopifnot(identical(is.na(corrected), is.na(x)))
+say("  missingness pattern unchanged (nothing imputed)")
+```
+
+# 5. Split and write
+
+**Every injection is written, references included**, in the input file's column order, with the
+annotation columns re-attached **unchanged**. The output filename carries a descriptive suffix so the
+input can never be overwritten.
+
+The three pooled `MIX_*` injections are kept deliberately: they are the technical control, and having
+them in the same file means the reference collapse can be re-checked downstream in Python instead of
+being taken on trust from section 6. They are corrected exactly like every other column — they carry
+their own `reference` level in `bio_group`, so the correction never pooled them with a cell line.
+
+⚠️ **They are not biological samples: drop them before clustering, PCA or any per-cell-line
+statistic.** They belong to no cell line and no timepoint, so anything that groups by those fields
+will either mis-assign them or silently create a spurious group. Select on the `MIX` cell-line token
+(or re-read `is_reference` from `batch_info.tsv`) and exclude them at load time.
+
+**On `OUTPUT_SCALE`.** The correction is done on log2 either way; this only decides what lands on
+disk. With the default `"log2"` the sample columns are renamed `raw:abs` → `log2:abs`, because a
+column called `raw:abs` that holds log2 values is a trap for anything reading the file later. Set
+`OUTPUT_SCALE <- "linear"` to back-transform with `2^x` instead, which is what
+`run_diapasef_transformations()` in `src/transformations.py` expects — it wants `raw:abs` linear
+intensities and does its own log2.
+
+```{r write-matrix}
+say("=== 5. Split and write ===")
+
+ref_cols <- sheet$sample_id[sheet$is_reference]
+bio_cols <- sheet$sample_id[!sheet$is_reference]
+
+# Columns to write: EVERY injection, references included, in the INPUT FILE's order.
+# `sheet$sample_id` is in injection order, so writing it as-is would silently reshuffle the
+# header relative to the input; `intersect()` keeps the order of its first argument, so this
+# restores the file's own layout. Nothing else is affected — the matrix is indexed by name
+# everywhere, so the ordering is presentation only.
+out_cols <- intersect(colnames(abundance), sheet$sample_id)
+stopifnot(setequal(out_cols, sheet$sample_id))
+
+if (length(ref_cols) < 2L) {
+  warning("write: fewer than 2 reference injections found — the reference QC below will ",
+          "be uninformative.", call. = FALSE)
+}
+say("  writing ", length(out_cols), " injections: ", length(bio_cols),
+    " biological + ", length(ref_cols), " pooled reference(s) kept as controls",
+    " — drop the references before clustering")
+
+out_matrix <- corrected[, out_cols, drop = FALSE]
+
+out_names <- out_cols
+if (identical(OUTPUT_SCALE, "linear")) {
+  say("  OUTPUT_SCALE = 'linear': back-transforming with 2^x (correction was done on log2)")
+  out_matrix <- 2 ^ out_matrix
+} else if (identical(OUTPUT_SCALE, "log2")) {
+  if (scaled$was_linear) {
+    out_names <- sub(RENAME_DATA_TYPE[["from"]], RENAME_DATA_TYPE[["to"]],
+                     out_names, fixed = TRUE)
+    say("  OUTPUT_SCALE = 'log2': DataType token renamed '",
+        RENAME_DATA_TYPE[["from"]], "' -> '", RENAME_DATA_TYPE[["to"]], "' in ",
+        sum(out_names != out_cols), " column name(s)")
+  }
+} else {
+  stop("OUTPUT_SCALE must be 'log2' or 'linear', got '", OUTPUT_SCALE, "'.")
+}
+
+out_df <- cbind(abundance[, annot_cols, drop = FALSE],
+                as.data.frame(out_matrix, check.names = FALSE))
+colnames(out_df) <- c(annot_cols, out_names)
+
+matrix_path <- output_path(ABUNDANCE_FILE, OUT_SUFFIX_MATRIX,
+                           out_dir = OUT_DIR, overwrite = OVERWRITE)
+utils::write.table(out_df, matrix_path,
+                   sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+say("  wrote clustering matrix: ", matrix_path,
+    "  (", nrow(out_df), " sites x ", ncol(out_df), " columns, ",
+    round(file.size(matrix_path) / 1e6), " MB)")
+```
+
+# 6. Reference QC — did the correction work?
+
+The three pooled references (`mix`, `mixb`, `mixc`) are the **same physical material** injected once
+per batch. Any spread across them is therefore purely technical, which makes them the validation:
+if the batch offsets are real and were estimated well, the references must collapse toward each other
+after correction.
+
+**Read it as:** median SD across sites should drop substantially, and the scatter cloud should sit
+below the identity line. It will not drop to zero — what remains is the ordinary run-to-run
+measurement noise the correction was never trying to remove.
+
+**The caveat that makes this near-independent rather than circular.** The references are 3 of ~219
+injections, so they contribute almost nothing to the batch estimate — that estimate is driven by the
+~216 biological samples. The correction is therefore not "fitted to" the references in any meaningful
+sense, and their convergence is close to out-of-sample evidence. It is still only a spot-check: only
+sites quantified in **all three** references are evaluable, and that subset is biased toward abundant
+sites.
+
+If the references do **not** collapse, the chunk warns. That means either the batch effect is not an
+additive shift (in which case this whole approach is the wrong one, not just badly tuned) or the
+`batch` assignment in the sheet is wrong. Do not use the corrected matrix until that is understood.
+
+```{r reference-qc, fig.width = 11, fig.height = 5}
+say("=== 6. Reference QC ===")
+
+if (length(ref_cols) >= 2L) {
+  before <- reference_spread(x, ref_cols)
+  after  <- reference_spread(corrected, ref_cols)
+
+  evaluable <- !is.na(before$sd)
+  say("  evaluable sites (quantified in all ", length(ref_cols), " references): ",
+      sum(evaluable), " / ", nrow(x),
+      " (", sprintf("%.1f%%", 100 * mean(evaluable)), ")")
+
+  if (sum(evaluable) > 0L) {
+    med_sd_before <- stats::median(before$sd[evaluable])
+    med_sd_after  <- stats::median(after$sd[evaluable])
+    med_cv_before <- stats::median(before$cv[evaluable], na.rm = TRUE)
+    med_cv_after  <- stats::median(after$cv[evaluable], na.rm = TRUE)
+
+    say("  median SD across references (log2):  ",
+        sprintf("%.4f -> %.4f  (%+.1f%%)", med_sd_before, med_sd_after,
+                100 * (med_sd_after / med_sd_before - 1)))
+    say("  median CV across references (log2 units, %): ",
+        sprintf("%.3f -> %.3f", med_cv_before, med_cv_after))
+    say("  sites whose spread shrank: ",
+        sprintf("%.1f%%", 100 * mean(after$sd[evaluable] < before$sd[evaluable])))
+
+    if (med_sd_after >= med_sd_before) {
+      warning("Reference QC: the references did NOT collapse (median SD ",
+              sprintf("%.4f -> %.4f", med_sd_before, med_sd_after),
+              "). Either the batch effect is not an additive shift, or the sample sheet's ",
+              "`batch` assignment is wrong. Do not use the corrected matrix until this is ",
+              "understood.", call. = FALSE)
+    }
+
+    qc_df <- data.frame(site = rownames(x),
+                        n_refs_observed = before$n_obs,
+                        sd_before = before$sd,
+                        sd_after = after$sd,
+                        cv_before = before$cv,
+                        cv_after = after$cv,
+                        stringsAsFactors = FALSE)
+    qc_path <- output_path(ABUNDANCE_FILE, OUT_SUFFIX_REF_QC,
+                           out_dir = OUT_DIR, overwrite = OVERWRITE)
+    utils::write.table(qc_df, qc_path,
+                       sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+    say("  wrote reference QC table: ", qc_path)
+
+    png_path <- output_path(ABUNDANCE_FILE, OUT_SUFFIX_REF_PNG,
+                            out_dir = OUT_DIR, overwrite = OVERWRITE)
+    plot_reference_qc(before, after, png_path)          # saved copy
+    plot_reference_qc(before, after)                    # inline, below
+    say("  wrote reference QC figure: ", png_path)
+  } else {
+    warning("Reference QC: no site is quantified in every reference — QC skipped.",
+            call. = FALSE)
+  }
+} else {
+  say("  skipped: fewer than 2 reference injections in the sheet")
+}
+```
+
+# Outputs, and what may be done with them
+
+| file | contents | consumers |
+|---|---|---|
+| `..._batchcorrected_linear.tsv` | annotation columns unchanged + **all 219 corrected injections** (216 biological + 3 `MIX_*` references), in input-file column order, back-transformed to the linear scale | clustering, PCA / UMAP, profile and curve plots — **after dropping the `MIX_*` columns** |
+| `..._batchcorrected_linear_refQC.tsv` | per-site reference spread before and after (`sd`, `cv`, `n_refs_observed`) | QC only |
+| `..._batchcorrected_linear_refQC.png` | the two-panel diagnostic above | QC only |
+
+Reading it in Python:
+
+```python
+import pandas as pd
+df = pd.read_csv(path, sep="\t", low_memory=False)   # never .fillna(0)
+```
+
+Two rules carry over to whatever reads this file:
+
+- **Missing values are `NA` and must stay `NaN`.** They are non-detections, not zeros. This applies
+  with extra force to any table this is later merged with that carries limma statistics columns — a
+  `FFDR` of `NaN` means *not tested*, and `0.0` reads as *perfectly significant*.
+- ⚠ **Do not test on this matrix.** Statistical testing stays on the **uncorrected** values with
+  `batch` in the design — see *The two tracks* at the top. This file exists so that a PCA shows
+  biology instead of acquisition order; it does not exist to make p-values smaller.
+
+# Expected warnings
+
+`Partial NA coefficients for N probe(s)` — emitted by `lmFit` inside `removeBatchEffect`. It fires
+whenever *any* coefficient is non-estimable for a site, and under DIA missingness that is usually a
+**biological** coefficient (a site never observed in one cell-line/timepoint group), which is
+harmless: that group simply has no fitted mean, and nothing is subtracted on its behalf. It does
+**not** mean the batch correction failed. The `sites with a non-estimable batch coefficient` line in
+the *Correct* chunk is the diagnostic that actually answers that question, and it is usually a much
+smaller number — often zero.
+
+```{r session-info}
+sessionInfo()
+```
