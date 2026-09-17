@@ -28,7 +28,28 @@
             </RMarkdownRenderProfile>
           </value>
         </entry>
+        <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/batch_correction_diapasef.rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
         <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/limma_for_pvalues.rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+        <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/limma_for_pvalues_diapasef.rmd">
+          <value>
+            <RMarkdownRenderProfile>
+              <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />
+            </RMarkdownRenderProfile>
+          </value>
+        </entry>
+        <entry key="file://$PROJECT_DIR$/notebooks/01_preprocessing/trendy_temporal_patterns.rmd">
           <value>
             <RMarkdownRenderProfile>
               <option name="outputDirectoryUrl" value="file://$PROJECT_DIR$/notebooks/01_preprocessing" />

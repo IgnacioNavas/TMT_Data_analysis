@@ -1,6 +1,8 @@
 # Data
 ./Experiment/
 
+Research_exchange_Ignacio_Navas_Camacho.md
+
 # Credentials and secrets
 .env
 *.key
