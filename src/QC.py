@@ -6,6 +6,8 @@ Sections follow the priority order in notebooks/02_qc/General_QC.ipynb:
   2. Quantification quality (sample-level)
   3. Normalization QC
   4. Comparing datasets (Venn diagrams, overlap statistics)
+  5. Differential statistics (limma results)
+  6. Temporal-profile correlation between cell lines / datasets
 
 All functions accept DataFrames that follow the project naming convention:
     {CellLine}_{DataType}:{subtype}_{Condition}_{Timepoint}_{Replicate}
@@ -22,6 +24,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+import plotly.graph_objects as go
 import plotly.io as pio
 from matplotlib_venn import venn2, venn3
 from scipy.spatial.distance import pdist, squareform
@@ -771,6 +774,7 @@ def replicate_coverage_depth(counts,
 def sites_with_coverage(depth, #I think this and the fucntion below shold be merged.
                         group,
                         min_reps=1,
+                        combine="all",
                         ):
     """
     List the sites covered in at least `min_reps` replicates at every timepoint.
@@ -780,18 +784,37 @@ def sites_with_coverage(depth, #I think this and the fucntion below shold be mer
     tables that have no composite site key). Read `depth.index.name` to see which one,
     or use filter_by_coverage to subset a DataFrame without handling the key at all.
 
+    Several groups can be queried at once. `combine` then decides how the per-group
+    results are joined, with the same "any"/"all" convention as filters.filter_by_ffdr:
+        combine="any"  -> union: the site has a complete time course at >= min_reps in
+                          AT LEAST ONE of the groups (e.g. "fully covered in some cell line").
+        combine="all"  -> intersection: complete in EVERY group. With one group per cell
+                          line this is the same as the "ALL" column of
+                          replicate_coverage_depth(include_all=True).
+    With a single group the two are identical.
+
     Args:
         depth: output of replicate_coverage_depth.
-        group: column name of the group to query, e.g. "WT" or "WT + EGFRT693A".
+        group: column name of the group to query, e.g. "WT" or "WT + EGFRT693A", or a
+            list of such names.
         min_reps: minimum coverage depth required, default 1.
+        combine: "all" (default, intersection) or "any" (union); only matters when
+            `group` is a list.
 
     Returns:
         pandas Index of the site keys meeting the requirement.
 
     """
-    if group not in depth.columns:
-        raise ValueError(f"Group {group!r} not found. Available: {list(depth.columns,)}")
-    return depth.index[depth[group] >= min_reps]
+    groups = [group] if isinstance(group, str,) else list(group,)
+    missing = [g for g in groups if g not in depth.columns]
+    if missing:
+        raise ValueError(f"Group(s) {missing} not found. Available: {list(depth.columns,)}")
+    if combine not in ("any", "all",):
+        raise ValueError(f"combine must be 'any' or 'all', got {combine!r}.")
+
+    passed = depth[groups] >= min_reps
+    mask = passed.any(axis=1,) if combine == "any" else passed.all(axis=1,)
+    return depth.index[mask.to_numpy()]
 
 
 def filter_by_coverage(df,
@@ -799,6 +822,7 @@ def filter_by_coverage(df,
                        group,
                        min_reps=1,
                        site_col=None,
+                       combine="all",
                        ):
     """
     Subset a DataFrame to the sites covered in at least `min_reps` replicates at every timepoint.
@@ -807,13 +831,19 @@ def filter_by_coverage(df,
     `depth.index.name`, so the filter cannot silently mismatch the key the coverage matrix
     was built on (e.g. filtering on 'peptide_index' a table indexed by 'site').
 
+    Passing a list of groups with combine="any" keeps the union: sites with a complete
+    time course in at least one of them (see sites_with_coverage).
+
     Args:
         df: the DataFrame the coverage matrix was computed from.
         depth: output of replicate_coverage_depth.
-        group: column name of the group to query, e.g. "WT + EGFRT693A".
+        group: column name of the group to query, e.g. "WT + EGFRT693A", or a list of
+            such names.
         min_reps: minimum coverage depth required, default 1.
         site_col: override for the key column in df; by default the column the coverage
             index was taken from, or df.index when it has no name.
+        combine: "all" (default, intersection) or "any" (union) across the groups in
+            `group`; only matters when `group` is a list.
 
     Returns:
         Filtered copy-free view of df containing only the covered sites.
@@ -821,7 +851,8 @@ def filter_by_coverage(df,
     """
     keys = sites_with_coverage(depth,
                                group=group,
-                               min_reps=min_reps,)
+                               min_reps=min_reps,
+                               combine=combine,)
 
     key_col = site_col if site_col is not None else depth.index.name
     if key_col is None:
@@ -1686,6 +1717,282 @@ def pca_plot_interactive(
     fig_variance.update_layout(coloraxis_showscale=False)
 
     return fig_scatter, fig_variance, pca_df
+
+
+def pca_centroid_plot_interactive(df,
+                                  cell_lines=None,
+                                  conditions=None,
+                                  data_type="raw:abs",
+                                  n_components=10,
+                                  impute=True,
+                                  impute_method="mean",
+                                  centroid_space="pca",
+                                  centroid_stat="mean",
+                                  color_by="condition",
+                                  symbol_by="stimulation",
+                                  error_bars="sd",
+                                  show_replicates=False,
+                                  figsize=(1000, 800),
+                                  title="PCA of condition centroids",
+                                  ):
+    """
+    Interactive Plotly PCA showing one point per condition group instead of one per replicate.
+
+    Companion to pca_plot_interactive(): same column selection, imputation and PCA, but each
+    (cell_line, condition, timepoint) group is drawn as a single centroid summarising its 3-4
+    replicates. Use it when the replicate-level plot is too crowded to read the biological
+    trajectory, and pca_plot_interactive() when the question is whether the replicates agree.
+
+    `centroid_space` chooses WHERE the averaging happens, and the two answers are not the same
+    plot:
+
+      "pca"  (default) - fit the PCA on all replicates, then average their PC coordinates.
+                         The embedding is identical to pca_plot_interactive(), so the axes and
+                         the % variance are directly comparable and the two figures can be read
+                         side by side. Replicate spread survives as the error bars.
+      "data"           - average the replicate intensities per group first, then fit the PCA on
+                         the group-level matrix. This is a DIFFERENT embedding: fewer, less
+                         noisy observations, so the loadings, the axes and the % variance all
+                         change and are NOT comparable to the replicate-level figure. It keeps
+                         more sites, because a site missing in one replicate still has a group
+                         mean, whereas the replicate-level PCA drops it.
+
+    Averaging replicates suppresses within-group noise, which makes group separation look
+    cleaner than it is: a centroid plot cannot tell you whether groups are separated relative
+    to replicate scatter. That is what the error bars are for - read them before believing the
+    separation, or go back to pca_plot_interactive().
+
+    Args:
+        df: DataFrame following the project naming convention.
+        cell_lines: list of cell-line prefixes, e.g. ["WT"].
+        conditions: list of condition substrings, e.g. ["_EGF_", "_INS_", "_EGFnINS_"].
+        data_type: data-type string for replicate columns, default "raw:abs".
+        n_components: number of PCs to compute (default 10); only PC1/PC2 are plotted.
+        impute: if True run impute_missing_replicates() before PCA (default True).
+        impute_method: "mean" or "median", passed to impute_missing_replicates().
+        centroid_space: "pca" (default) - average PC coordinates of the replicates;
+                        "data" - average intensities first, then run PCA on the group matrix.
+        centroid_stat: "mean" (default) or "median" - statistic used for the centroid.
+        color_by: "condition" (default) - colour by condition x timepoint group;
+                  "cell_line" - colour by cell-line prefix.
+        symbol_by: what the marker shape encodes: "stimulation" (default), "timepoint"
+                   or "condition"; same meaning as in pca_plot_interactive().
+        error_bars: replicate spread drawn on each centroid, in PC units:
+                    "sd" (default) - standard deviation across replicates;
+                    "sem" - standard error of the mean (sd / sqrt(n));
+                    None - no bars. Ignored when centroid_space="data", where the
+                    replicates are averaged before the PCA and no spread exists.
+        show_replicates: if True also draw the individual replicates as small faint points
+                         behind the centroids. Only available when centroid_space="pca".
+        figsize: (width, height) in pixels for the Plotly figure.
+        title: figure title.
+
+    Returns:
+        fig_scatter: Plotly Figure - PC1 vs PC2 scatter of the centroids.
+        fig_variance: Plotly Figure - variance explained bar chart.
+        centroid_df: DataFrame - one row per group, with PC coordinates, the per-PC spread
+                     ("PC1_sd"/"PC1_sem", ...), n_reps, and the group metadata columns.
+    """
+    if cell_lines is None:
+        cell_lines = []
+    if conditions is None:
+        conditions = []
+
+    if centroid_space not in ("pca", "data"):
+        raise ValueError(f"centroid_space must be 'pca' or 'data', got {centroid_space!r}")
+    if centroid_stat not in ("mean", "median"):
+        raise ValueError(f"centroid_stat must be 'mean' or 'median', got {centroid_stat!r}")
+    if error_bars not in ("sd", "sem", None):
+        raise ValueError(f"error_bars must be 'sd', 'sem' or None, got {error_bars!r}")
+
+    # --- Column selection (identical to pca_plot_interactive) ---
+    cols = ColumnSpec.select(df,
+                             cell_lines=cell_lines,
+                             data_type=data_type,
+                             conditions=conditions,)
+    cols = [c for c in cols if _is_replicate_col(c)]
+    if not cols:
+        raise ValueError(f"No replicate columns found for data_type={data_type!r}")
+
+    # --- Optional imputation ---
+    if impute:
+        df = impute_missing_replicates(df,
+                                       cell_lines=cell_lines,
+                                       conditions=conditions,
+                                       data_type=data_type,
+                                       method=impute_method,)
+
+    # --- Group key: everything except the replicate suffix and the DataType field ---
+    # Keeps the cell-line prefix so several cell lines give distinct groups
+    # (WT_EGF_full vs BRAFS151A_EGF_full), matching pca_distance_heatmap().
+    def _group_label(col):
+        parts = _REP_RE.sub("", col).split("_")
+        return "_".join([parts[0]] + parts[2:])
+
+    groups = {}
+    for col in cols:
+        groups.setdefault(_group_label(col), []).append(col)
+    group_order = list(groups)
+
+    rep_df = None
+
+    if centroid_space == "pca":
+        # ---------------------------------------------------------------------------
+        # Fit the PCA on the replicates, then average the coordinates.
+        # ---------------------------------------------------------------------------
+        mat = df[cols].replace(0, np.nan).T      # rows = samples, columns = sites
+        mat = mat.dropna(axis=1)                 # drop sites missing in any sample
+
+        X_scaled = StandardScaler().fit_transform(mat.values)
+        n_comp = min(n_components, mat.shape[0], mat.shape[1])
+        pca = PCA(n_components=n_comp, random_state=0)
+        coords = pca.fit_transform(X_scaled)
+
+        pc_cols = [f"PC{i + 1}" for i in range(n_comp)]
+        rep_df = pd.DataFrame(coords, columns=pc_cols)
+        rep_df["sample"] = mat.index.tolist()
+        rep_df["group"] = rep_df["sample"].apply(_group_label)
+
+        grouped = rep_df.groupby("group", sort=False)[pc_cols]
+        centroid_df = grouped.median() if centroid_stat == "median" else grouped.mean()
+        spread = rep_df.groupby("group", sort=False)[pc_cols].std(ddof=1)
+        n_reps = rep_df.groupby("group", sort=False).size()
+
+        if error_bars == "sem":
+            spread = spread.div(np.sqrt(n_reps), axis=0)
+        # A single-replicate group has an undefined spread; draw it as zero rather than
+        # dropping the point, so the group stays visible and its n_reps=1 shows in the hover.
+        spread = spread.fillna(0.0)
+
+        keep = [g for g in group_order if g in centroid_df.index]
+        centroid_df = centroid_df.reindex(keep)
+        spread = spread.reindex(keep)
+        n_reps = n_reps.reindex(keep)
+    else:
+        # ---------------------------------------------------------------------------
+        # Average the intensities first, then fit the PCA on the group-level matrix.
+        # ---------------------------------------------------------------------------
+        vals = df[cols].replace(0, np.nan)
+        agg = {}
+        for grp, grp_cols in groups.items():
+            sub = vals[grp_cols]
+            agg[grp] = sub.median(axis=1) if centroid_stat == "median" else sub.mean(axis=1)
+        # rows = sites, columns = groups  ->  transpose to (groups x sites)
+        mat = pd.DataFrame(agg)[group_order].T
+        mat = mat.dropna(axis=1)                 # drop sites missing in any GROUP
+
+        X_scaled = StandardScaler().fit_transform(mat.values)
+        n_comp = min(n_components, mat.shape[0], mat.shape[1])
+        pca = PCA(n_components=n_comp, random_state=0)
+        coords = pca.fit_transform(X_scaled)
+
+        pc_cols = [f"PC{i + 1}" for i in range(n_comp)]
+        centroid_df = pd.DataFrame(coords, columns=pc_cols, index=mat.index)
+        spread = pd.DataFrame(0.0, index=centroid_df.index, columns=pc_cols)
+        n_reps = pd.Series({g: len(c) for g, c in groups.items()}).reindex(centroid_df.index)
+
+        # The replicates were averaged away before the PCA, so neither the spread nor the
+        # individual points exist in this embedding.
+        error_bars = None
+        show_replicates = False
+
+    # --- Metadata columns, derived from the group label ---
+    centroid_df.index.name = "group"
+    centroid_df = centroid_df.reset_index()
+    centroid_df["n_reps"] = centroid_df["group"].map(n_reps).astype(int)
+
+    suffix = "sem" if error_bars == "sem" else "sd"
+    for pc in pc_cols:
+        centroid_df[f"{pc}_{suffix}"] = centroid_df["group"].map(spread[pc])
+
+    # group = "{cell_line}_{condition}_{timepoint}"; the condition label drops the cell line
+    centroid_df["cell_line"] = centroid_df["group"].apply(lambda g: g.split("_")[0])
+    centroid_df["condition"] = centroid_df["group"].apply(lambda g: "_".join(g.split("_")[1:]))
+    centroid_df["timepoint"] = centroid_df["group"].apply(lambda g: g.split("_")[-1])
+
+    def _stimulation_symbol(label):
+        if "EGFnINS" in label:
+            return "cross"
+        elif "EGF" in label:
+            return "diamond"
+        elif "INS" in label:
+            return "square"
+        return "circle"
+
+    if color_by == "cell_line":
+        centroid_df["color_group"] = centroid_df["cell_line"]
+    else:
+        centroid_df["color_group"] = centroid_df["condition"]
+
+    if symbol_by == "timepoint":
+        centroid_df["symbol"] = centroid_df["timepoint"]
+    elif symbol_by == "condition":
+        centroid_df["symbol"] = centroid_df["condition"]
+    else:
+        centroid_df["symbol"] = centroid_df["condition"].apply(_stimulation_symbol)
+
+    # --- Scatter: PC1 vs PC2 ---
+    var_pct = pca.explained_variance_ratio_ * 100
+    err_x = f"PC1_{suffix}" if error_bars is not None else None
+    err_y = f"PC2_{suffix}" if error_bars is not None else None
+
+    fig_scatter = px.scatter(centroid_df,
+                             x="PC1",
+                             y="PC2",
+                             color="color_group",
+                             symbol="symbol",
+                             error_x=err_x,
+                             error_y=err_y,
+                             hover_name="group",
+                             hover_data={"condition": True,
+                                         "timepoint": True,
+                                         "n_reps": True,
+                                         "PC1": ":.2f",
+                                         "PC2": ":.2f",
+                                         "color_group": False,
+                                         "symbol": False,},
+                             title=title,
+                             labels={"PC1": f"PC1 ({var_pct[0]:.1f}% var)",
+                                     "PC2": f"PC2 ({var_pct[1]:.1f}% var)",
+                                     "color_group": color_by,
+                                     "symbol": symbol_by,},
+                             width=figsize[0],
+                             height=figsize[1],)
+    fig_scatter.update_traces(marker=dict(size=14,
+                                          line=dict(width=1.2, color="DarkSlateGrey")))
+
+    # --- Optional faint replicate cloud behind the centroids ---
+    if show_replicates and rep_df is not None:
+        fig_scatter.add_trace(go.Scatter(x=rep_df["PC1"],
+                                         y=rep_df["PC2"],
+                                         mode="markers",
+                                         name="replicates",
+                                         text=rep_df["sample"],
+                                         hoverinfo="text",
+                                         marker=dict(size=5,
+                                                     color="lightgrey",
+                                                     line=dict(width=0)),))
+        # keep the faint cloud underneath the centroids
+        fig_scatter.data = fig_scatter.data[-1:] + fig_scatter.data[:-1]
+
+    fig_scatter.update_layout(plot_bgcolor="white", paper_bgcolor="white")
+
+    # --- Variance explained bar chart ---
+    var_df = pd.DataFrame({"Principal Component": pc_cols,
+                           "Variance Explained (%)": var_pct,})
+    fig_variance = px.bar(var_df,
+                          x="Principal Component",
+                          y="Variance Explained (%)",
+                          title="Variance explained per PC",
+                          text=var_df["Variance Explained (%)"].round(1).astype(str) + "%",
+                          color="Variance Explained (%)",
+                          color_continuous_scale="Blues",
+                          width=800,
+                          height=450,)
+    fig_variance.update_traces(textposition="outside")
+    fig_variance.update_layout(coloraxis_showscale=False)
+
+    return fig_scatter, fig_variance, centroid_df
 
 
 def umap_plot_interactive(
@@ -2748,3 +3055,891 @@ def limma_responsive_sites(df,
         fig.suptitle(title, weight="bold",)
         fig.tight_layout()
     return responsive_table, specificity_table, fig, axes
+
+
+##############################################################################
+# Section 6: Temporal-profile correlation (between cell lines / datasets)
+##############################################################################
+#
+# Used by notebooks/02_qc/diaPASEF_profile_correlation.ipynb (mutant cell lines vs WT) and
+# notebooks/02_qc/WT_datasets_profile_correlation.ipynb (hme1_1 vs hme1_2 vs hme1_diaPASEF).
+#
+# A "profile" here is a sites x timepoints matrix of one cell line (or one dataset), by default
+# log2:FC against starve with `full` and `starve` left out: starve is identically 0 on the FC
+# scale, so it would add a shared constant point to every vector, and full is not an EGF response.
+#
+# Three complementary summaries are provided, because they answer different questions:
+#   global_profile_correlation      one r per pair, all sites x timepoints flattened. Carries
+#                                   amplitude: dominated by the sites that move most.
+#   per_site_profile_correlation    one r per site per pair: does this site have the same *shape*
+#                                   in both? Amplitude-free. With 4-7 timepoints each r is noisy,
+#                                   so read distributions / medians, never single sites.
+#   per_timepoint_correlation       one r per timepoint per pair, across sites: at which moment do
+#                                   the two agree or diverge? Invariant to a per-timepoint shift.
+
+_SITE_INDEX_RE = re.compile(r"^(?P<protein>.+?)_(?P<start>\d+)_(?P<end>\d+)_(?P<n_phos>\d+)_(?P<n_loc>\d+)"
+                            r"(?:_(?P<positions>[STY0-9]+))?$")
+_UNIMOD_RE = re.compile(r"\(UniMod:\d+\)")
+
+
+def parse_site_key(df,
+                   site_col="site",
+                   ):
+    """
+    Split the composite project `site` key into its parts.
+
+    The key is `{protein}_{start}_{end}_{n_phos}_{n_localized}[_{positions}]~{modified_sequence}`
+    in every current dataset (TMT and diaPASEF). The modified sequence is returned with the
+    diaPASEF UniMod tags removed (e.g. 'C(UniMod:4)', '(UniMod:1)'), because FragPipe writes them
+    for the DIA output but not for the TMT tables, and the same phosphopeptide would otherwise
+    never match across platforms. Phospho residues stay lowercase.
+
+    Args:
+        df: DataFrame with a `site_col` column.
+        site_col: name of the composite key column, default "site".
+
+    Returns:
+        DataFrame aligned with df (same index) with columns protein, start, end, n_phos,
+        n_localized (integers, NaN if the key does not parse), positions (e.g. 'S166' or
+        'S565T569', '' when nothing is localized) and modified_sequence (UniMod-free).
+
+    """
+    site = df[site_col].astype(str,)
+    index_part = site.str.split("~", n=1,).str[0]
+    seq_part = site.str.split("~", n=1,).str[1]
+
+    parts = index_part.str.extract(_SITE_INDEX_RE,)
+    for col in ("start", "end", "n_phos", "n_loc",):
+        parts[col] = pd.to_numeric(parts[col], errors="coerce",)
+    parts = parts.rename(columns={"n_loc": "n_localized"},)
+    parts["positions"] = parts["positions"].fillna("",)
+    parts["modified_sequence"] = seq_part.str.replace(_UNIMOD_RE, "", regex=True,)
+    parts.index = df.index
+    return parts
+
+
+def fully_localized_mask(df,
+                         site_col="site",
+                         ):
+    """
+    Flag the sites whose phosphorylations are all confidently localized.
+
+    Read from the site key itself (n_localized == n_phos > 0), so it works the same on TMT and
+    diaPASEF tables, which carry different FragPipe localization columns.
+
+    Args:
+        df: DataFrame with a composite `site_col` key.
+        site_col: name of the composite key column, default "site".
+
+    Returns:
+        Boolean Series aligned with df.
+
+    """
+    parts = parse_site_key(df,
+                           site_col=site_col,)
+    return (parts["n_phos"] > 0) & (parts["n_localized"] == parts["n_phos"])
+
+
+def site_match_key(df,
+                   key="peptide",
+                   site_col="site",
+                   protein_col="protein_Id",
+                   ):
+    """
+    Build a key that identifies the same phospho-species across datasets.
+
+    The raw `site` string is not a good cross-dataset key: it embeds peptide start/end positions,
+    which move when the protein database version changes (hme1_1 and hme1_2 disagree for ~3% of
+    shared peptides), and the diaPASEF sequences carry UniMod tags that TMT sequences do not.
+
+    Args:
+        df: DataFrame with the composite `site_col` key and a `protein_col` accession column.
+        key: which identity to use:
+            "peptide"     (default) protein accession + UniMod-free modified sequence, e.g.
+                          'P16333~GSYNGQVGWFPSNYVTEEGDsPLGDHVGSLSEK'. Same phosphopeptide with the
+                          same phospho positions; robust to database renumbering.
+            "phosphosite" protein accession + localized phospho positions, e.g. 'P16333_S166'.
+                          Pools different peptides (missed cleavages, oxidation) that carry the
+                          same site, so it gives more matches but several rows per key.
+                          Sites with nothing localized get NaN.
+            "site"        the site key with UniMod tags stripped (position-sensitive).
+        site_col: name of the composite key column, default "site".
+        protein_col: name of the accession column, default "protein_Id".
+
+    Returns:
+        Series of keys aligned with df (NaN where no key can be built).
+
+    """
+    parts = parse_site_key(df,
+                           site_col=site_col,)
+    protein = df[protein_col].astype(str,)
+
+    if key == "peptide":
+        out = protein + "~" + parts["modified_sequence"]
+    elif key == "phosphosite":
+        out = (protein + "_" + parts["positions"]).where(parts["positions"] != "",)
+    elif key == "site":
+        out = df[site_col].astype(str,).str.replace(_UNIMOD_RE, "", regex=True,)
+    else:
+        raise ValueError(f"key must be 'peptide', 'phosphosite' or 'site', got {key!r}.")
+    return out.rename(f"match_key_{key}",)
+
+
+def deduplicate_by_key(df,
+                       key,
+                       profile_cols,
+                       intensity_cols=None,
+                       ):
+    """
+    Keep one row per match key.
+
+    When several rows share a key (typical for key="phosphosite", rare for "peptide"), the row
+    kept is the one with the fewest missing values in `profile_cols`; ties are broken by the
+    highest median intensity in `intensity_cols` (if given), then by original order. The choice
+    never looks at the values being correlated, so it cannot bias the correlation.
+
+    Args:
+        df: DataFrame to deduplicate.
+        key: Series of match keys aligned with df (e.g. from site_match_key). Rows with a NaN
+            key are dropped.
+        profile_cols: columns whose completeness ranks the duplicates.
+        intensity_cols: optional columns whose row median breaks ties (e.g. raw:mean columns).
+
+    Returns:
+        Tuple (deduplicated DataFrame indexed by the key, number of rows dropped as duplicates).
+
+    """
+    work = df.assign(_key=key.to_numpy(),
+                     _n_missing=df[profile_cols].isna().sum(axis=1,).to_numpy(),
+                     _intensity=(df[intensity_cols].median(axis=1,).to_numpy()
+                                 if intensity_cols else 0.0),
+                     _order=np.arange(len(df,),),)
+    work = work[work["_key"].notna()]
+    work = work.sort_values(["_n_missing", "_intensity", "_order",],
+                            ascending=[True, False, True,],)
+    n_before = len(work)
+    work = work.drop_duplicates("_key", keep="first",).sort_values("_order",)
+    n_dropped = n_before - len(work)
+    work = work.set_index("_key",).drop(columns=["_n_missing", "_intensity", "_order",],)
+    work.index.name = "match_key"
+    return work, n_dropped
+
+
+def profile_matrix(df,
+                   cell_line,
+                   condition="EGF",
+                   data_type="log2:FC",
+                   timepoints=None,
+                   exclude_full=True,
+                   exclude_starve=True,
+                   center=None,
+                   ):
+    """
+    Extract one cell line's temporal profile as a sites x timepoints matrix.
+
+    Columns are selected with ColumnSpec.select and then checked on the exact cell-line and
+    condition fields, because ColumnSpec matches the cell line as a prefix (a prefix 'BRAFS151A'
+    would also pull in BRAFS151A1 and BRAFS151A2).
+
+    Args:
+        df: DataFrame following the project naming convention; its index is kept as the row index.
+        cell_line: exact cell-line field, e.g. "WT" or "BRAFS151A1".
+        condition: condition token, with or without underscores, e.g. "EGF".
+        data_type: data type of the profile, default "log2:FC".
+        timepoints: optional list of timepoint labels to keep (in any order; output is ordered
+            experimentally). Labels absent from df raise an error.
+        exclude_full: drop the 'full' timepoint (default True).
+        exclude_starve: drop the 'starve' timepoint (default True; identically 0 for log2:FC).
+        center: None (default) or "median". "median" subtracts each timepoint's median across
+            the rows of df, removing a shift shared by all sites at that timepoint (for example an
+            unnormalised loading offset). Computed on the rows passed in, so filter first.
+
+    Returns:
+        DataFrame (rows = df.index, columns = timepoint labels as strings, experimentally ordered).
+
+    """
+    condition = condition.strip("_",)
+    cols = ColumnSpec.select(df,
+                             cell_lines=[cell_line],
+                             data_type=data_type,
+                             conditions=[f"_{condition}_"],
+                             exclude_replicate_cols=True,)
+    by_tp = {}
+    for col in cols:
+        parts = col.split("_",)
+        if len(parts,) == 4 and parts[0] == cell_line and parts[2] == condition:
+            by_tp[parts[3]] = col
+
+    drop = set()
+    if exclude_full:
+        drop.add("full",)
+    if exclude_starve:
+        drop.add("starve",)
+    if timepoints is not None:
+        missing = [str(t) for t in timepoints if str(t) not in by_tp]
+        if missing:
+            raise ValueError(f"{cell_line} / {condition} / {data_type}: timepoints {missing} not "
+                             f"found. Available: {_order_timepoints(by_tp.keys(),)}")
+        keep = [str(t) for t in timepoints]
+    else:
+        keep = list(by_tp.keys(),)
+    keep = [t for t in _order_timepoints(keep,) if t not in drop]
+    if not keep:
+        raise ValueError(f"No {data_type} columns left for {cell_line} / {condition}.")
+
+    matrix = df[[by_tp[t] for t in keep]].copy()
+    matrix.columns = keep
+
+    if center == "median":
+        matrix = matrix - matrix.median(axis=0,)
+    elif center is not None:
+        raise ValueError(f"center must be None or 'median', got {center!r}.")
+    return matrix
+
+
+def common_timepoints(dfs,
+                      cell_lines,
+                      condition="EGF",
+                      data_type="log2:FC",
+                      exclude_full=True,
+                      exclude_starve=True,
+                      ):
+    """
+    Timepoints present in every dataset, for one condition.
+
+    Args:
+        dfs: dict {name: DataFrame}.
+        cell_lines: dict {name: cell-line field} or a single cell-line string used for all.
+        condition: condition token, default "EGF".
+        data_type: data type to look for, default "log2:FC".
+        exclude_full: leave 'full' out (default True).
+        exclude_starve: leave 'starve' out (default True).
+
+    Returns:
+        List of shared timepoint labels in experimental order.
+
+    """
+    shared = None
+    for name, df in dfs.items():
+        cell = cell_lines if isinstance(cell_lines, str,) else cell_lines[name]
+        tps = profile_matrix(df.head(1,),
+                             cell_line=cell,
+                             condition=condition,
+                             data_type=data_type,
+                             exclude_full=exclude_full,
+                             exclude_starve=exclude_starve,).columns
+        shared = set(tps,) if shared is None else shared & set(tps,)
+    return _order_timepoints(shared,)
+
+
+def align_profiles(profiles,
+                   dropna=True,
+                   ):
+    """
+    Restrict several profile matrices to their shared rows and timepoints.
+
+    Args:
+        profiles: dict {name: sites x timepoints DataFrame} (e.g. from profile_matrix), indexed by
+            a common site key.
+        dropna: drop every row that is missing in any profile at any shared timepoint (default
+            True), so all pairs are compared on exactly the same values.
+
+    Returns:
+        Dict with the same keys, every matrix with identical index and columns.
+
+    """
+    names = list(profiles,)
+    shared_rows = profiles[names[0]].index
+    shared_cols = list(profiles[names[0]].columns,)
+    for name in names[1:]:
+        shared_rows = shared_rows.intersection(profiles[name].index, sort=False,)
+        shared_cols = [c for c in shared_cols if c in profiles[name].columns]
+    if not shared_cols:
+        raise ValueError("The profiles share no timepoints.")
+
+    aligned = {n: profiles[n].loc[shared_rows, shared_cols] for n in names}
+    if dropna:
+        complete = np.ones(len(shared_rows,), dtype=bool,)
+        for mat in aligned.values():
+            complete &= mat.notna().all(axis=1,).to_numpy()
+        aligned = {n: m.loc[complete] for n, m in aligned.items()}
+    return aligned
+
+
+def _rowwise_correlation(a,
+                         b,
+                         method="uncentered",
+                         ):
+    """
+    Correlation between matching rows of two equally shaped arrays.
+
+    Args:
+        a: 2-D array (sites x timepoints).
+        b: 2-D array of the same shape.
+        method: "pearson", "spearman" or "uncentered" (cosine similarity, i.e. Pearson without
+            removing the row mean).
+
+    Returns:
+        1-D array with one coefficient per row; NaN where a row has zero variance (pearson /
+        spearman) or zero norm (uncentered).
+
+    """
+    a = np.asarray(a, dtype=float,)
+    b = np.asarray(b, dtype=float,)
+    if method == "spearman":
+        a = pd.DataFrame(a,).rank(axis=1,).to_numpy()
+        b = pd.DataFrame(b,).rank(axis=1,).to_numpy()
+        method = "pearson"
+    if method == "pearson":
+        a = a - a.mean(axis=1, keepdims=True,)
+        b = b - b.mean(axis=1, keepdims=True,)
+    elif method != "uncentered":
+        raise ValueError(f"method must be 'pearson', 'spearman' or 'uncentered', got {method!r}.")
+    num = (a * b).sum(axis=1,)
+    den = np.sqrt((a ** 2).sum(axis=1,) * (b ** 2).sum(axis=1,))
+    with np.errstate(invalid="ignore", divide="ignore",):
+        r = num / den
+    r[den == 0] = np.nan
+    return r
+
+
+def global_profile_correlation(profiles,
+                               method="pearson",
+                               ):
+    """
+    One correlation per pair of profiles, over every site x timepoint value.
+
+    Each aligned matrix is flattened to a single vector and the vectors are correlated. Because the
+    values are not standardised per site, the result is weighted by amplitude: sites with large
+    fold changes dominate, and flat sites contribute little but their noise.
+
+    Args:
+        profiles: dict {name: sites x timepoints DataFrame}; aligned internally (complete rows only).
+        method: "pearson" (default) or "spearman".
+
+    Returns:
+        Square DataFrame (names x names) of correlation coefficients. The number of sites used is
+        stored in `.attrs["n_sites"]`, the timepoints in `.attrs["timepoints"]`.
+
+    """
+    aligned = align_profiles(profiles,)
+    flat = pd.DataFrame({n: m.to_numpy().ravel() for n, m in aligned.items()},)
+    matrix = flat.corr(method=method,)
+    first = next(iter(aligned.values()),)
+    matrix.attrs["n_sites"] = len(first,)
+    matrix.attrs["timepoints"] = list(first.columns,)
+    matrix.attrs["method"] = method
+    return matrix
+
+
+def per_site_profile_correlation(profiles,
+                                 reference=None,
+                                 method="uncentered",
+                                 shuffle=False,
+                                 seed=0,
+                                 ):
+    """
+    Correlation between the temporal profiles of the same site in two cell lines / datasets.
+
+    Default method is the *uncentered* correlation (cosine similarity). log2:FC has a natural zero,
+    the starve baseline, and the uncentered coefficient keeps it: a site that goes up in one cell
+    line and down in the other scores negative. Pearson removes each profile's own mean first, so
+    it compares only the shape among the stimulated timepoints — a site rising 2 -> 5 min in both
+    scores +1 even if one profile sits entirely below baseline and the other above.
+
+    Args:
+        profiles: dict {name: sites x timepoints DataFrame}; aligned internally (complete rows only).
+        reference: name of the reference profile (e.g. "WT"). If given, only pairs
+            (reference, other) are computed; if None, every unordered pair.
+        method: "uncentered" (default), "pearson" or "spearman".
+        shuffle: if True, the rows of profile_b are randomly permuted before correlating, so each
+            site is compared with a *different* site. This is the chance level: whatever r survives
+            it comes from structure shared by all sites (a common per-timepoint shift, or the
+            generic early-peak shape of the EGF response), not from site identity.
+        seed: random seed for the permutation.
+
+    Returns:
+        Long DataFrame with columns match_key, profile_a, profile_b, r (one row per site per pair).
+
+    """
+    aligned = align_profiles(profiles,)
+    names = list(aligned,)
+    if reference is not None:
+        if reference not in aligned:
+            raise ValueError(f"reference={reference!r} not in profiles: {names}")
+        pairs = [(reference, n,) for n in names if n != reference]
+    else:
+        pairs = [(names[i], names[j],) for i in range(len(names,)) for j in range(i + 1, len(names,))]
+
+    rng = np.random.default_rng(seed,)
+    frames = []
+    for a, b in pairs:
+        values_b = aligned[b].to_numpy()
+        if shuffle:
+            values_b = values_b[rng.permutation(len(values_b,),)]
+        r = _rowwise_correlation(aligned[a].to_numpy(),
+                                 values_b,
+                                 method=method,)
+        frames.append(pd.DataFrame({"match_key": aligned[a].index,
+                                    "profile_a": a,
+                                    "profile_b": b,
+                                    "r": r,}),)
+    out = pd.concat(frames, ignore_index=True,)
+    out.attrs["method"] = method
+    out.attrs["shuffled"] = shuffle
+    return out
+
+
+def summarise_per_site_correlation(per_site,
+                                   stat="median",
+                                   ):
+    """
+    Collapse per-site correlations into a square matrix.
+
+    Args:
+        per_site: output of per_site_profile_correlation.
+        stat: "median" (default) or "mean" of the per-site coefficients.
+
+    Returns:
+        Square DataFrame (names x names), symmetric, diagonal 1. Pairs that were not computed
+        (e.g. mutant vs mutant when a reference was given) are NaN.
+
+    """
+    agg = per_site.groupby(["profile_a", "profile_b",],)["r"].agg(stat,)
+    names = list(dict.fromkeys(list(per_site["profile_a"],) + list(per_site["profile_b"],)),)
+    matrix = pd.DataFrame(np.nan, index=names, columns=names,)
+    for (a, b), value in agg.items():
+        matrix.loc[a, b] = value
+        matrix.loc[b, a] = value
+    np.fill_diagonal(matrix.values, 1.0,)
+    matrix.attrs["method"] = f"{stat} per-site {per_site.attrs.get('method', '')}".strip()
+    return matrix
+
+
+def plot_per_site_distributions(per_site,
+                                null=None,
+                                title="Per-site profile correlation",
+                                figsize=(9, 5),
+                                save_path=None,
+                                ):
+    """
+    Violin plot of per-site correlations, one violin per pair, with an optional chance level.
+
+    Args:
+        per_site: output of per_site_profile_correlation.
+        null: optional output of per_site_profile_correlation(..., shuffle=True) on the same
+            profiles; its median per pair is drawn as a red bar, and the fraction of sites above
+            the null 95th percentile is printed in the summary.
+        title: figure title.
+        figsize: figure size.
+        save_path: optional path to save the figure.
+
+    Returns:
+        Tuple (fig, summary DataFrame with pair, n_sites, median_r, iqr_low, iqr_high and, if
+        null is given, null_median_r, null_p95 and frac_above_null_p95).
+
+    """
+    labels = (per_site["profile_a"] + " vs " + per_site["profile_b"]).to_numpy()
+    pairs = list(dict.fromkeys(labels,),)
+    rows, data = [], []
+    for pair in pairs:
+        r = per_site.loc[labels == pair, "r"].dropna().to_numpy()
+        data.append(r,)
+        row = {"pair": pair,
+               "n_sites": r.size,
+               "median_r": np.median(r,),
+               "iqr_low": np.percentile(r, 25,),
+               "iqr_high": np.percentile(r, 75,),}
+        if null is not None:
+            null_labels = (null["profile_a"] + " vs " + null["profile_b"]).to_numpy()
+            r0 = null.loc[null_labels == pair, "r"].dropna().to_numpy()
+            row["null_median_r"] = np.median(r0,)
+            row["null_p95"] = np.percentile(r0, 95,)
+            row["frac_above_null_p95"] = float((r > row["null_p95"]).mean(),)
+        rows.append(row,)
+    summary = pd.DataFrame(rows,)
+
+    fig, ax = plt.subplots(figsize=figsize,)
+    colors = sns.color_palette("tab10", n_colors=len(pairs,),)
+    parts = ax.violinplot(data, showmedians=False, showextrema=False,)
+    for body, color in zip(parts["bodies"], colors,):
+        body.set_facecolor(color,)
+        body.set_alpha(0.6,)
+    ax.boxplot(data, widths=0.12, showfliers=False, medianprops={"color": "black"},)
+    if null is not None:
+        for i, value in enumerate(summary["null_median_r"], start=1,):
+            ax.hlines(value, i - 0.3, i + 0.3, color="red", lw=2,
+                      label="shuffled-site median (chance)" if i == 1 else None,)
+        ax.legend(fontsize=8, loc="lower left",)
+    ax.axhline(0, color="grey", lw=0.8,)
+    ax.set_xticks(np.arange(1, len(pairs,) + 1,),)
+    ax.set_xticklabels(pairs, rotation=30, ha="right",)
+    ax.set_ylabel(f"per-site {per_site.attrs.get('method', '')} r")
+    ax.set_title(title, weight="bold",)
+    ax.grid(axis="y", alpha=0.3,)
+    fig.tight_layout()
+    _save_figure(fig,
+                 save_path,)
+    plt.show()
+    return fig, summary
+
+
+def per_timepoint_correlation(profiles,
+                              reference=None,
+                              method="pearson",
+                              ):
+    """
+    Correlation across sites at each timepoint, per pair of profiles.
+
+    Answers "at which timepoint do the two agree?". Invariant to a shift shared by all sites at a
+    timepoint (Pearson / Spearman remove the mean of each column), so an unnormalised loading
+    offset does not affect it.
+
+    Args:
+        profiles: dict {name: sites x timepoints DataFrame}; aligned internally (complete rows only).
+        reference: name of the reference profile; if None every unordered pair is computed.
+        method: "pearson" (default) or "spearman".
+
+    Returns:
+        Long DataFrame with columns profile_a, profile_b, pair, timepoint, r, n_sites.
+
+    """
+    aligned = align_profiles(profiles,)
+    names = list(aligned,)
+    if reference is not None:
+        pairs = [(reference, n,) for n in names if n != reference]
+    else:
+        pairs = [(names[i], names[j],) for i in range(len(names,)) for j in range(i + 1, len(names,))]
+
+    rows = []
+    for a, b in pairs:
+        for tp in aligned[a].columns:
+            rows.append({"profile_a": a,
+                         "profile_b": b,
+                         "pair": f"{a} vs {b}",
+                         "timepoint": tp,
+                         "r": aligned[a][tp].corr(aligned[b][tp], method=method,),
+                         "n_sites": len(aligned[a],),},)
+    return pd.DataFrame(rows,)
+
+
+def _save_figure(fig,
+                 save_path,
+                 ):
+    """
+    Save a figure if a path is given, creating the parent directory.
+
+    Args:
+        fig: matplotlib Figure.
+        save_path: output path, or None to skip.
+
+    Returns:
+        None
+
+    """
+    if save_path is None:
+        return
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(save_path,),), exist_ok=True,)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight",)
+
+
+def plot_correlation_heatmap(matrix,
+                             title="Profile correlation",
+                             cluster=True,
+                             annot=True,
+                             vmin=None,
+                             vmax=1.0,
+                             cmap="viridis",
+                             figsize=(8, 7),
+                             save_path=None,
+                             ):
+    """
+    Heatmap of a square correlation matrix, optionally ordered by hierarchical clustering.
+
+    With cluster=True the rows/columns are ordered by average-linkage clustering on the distance
+    1 - r and the dendrogram is drawn, so cell lines / datasets with similar profiles sit together.
+
+    Args:
+        matrix: square DataFrame of correlations (e.g. global_profile_correlation). NaN cells are
+            shown blank; clustering requires a complete matrix and is skipped otherwise.
+        title: figure title; the number of sites (matrix.attrs["n_sites"]) is appended if present.
+        cluster: order by hierarchical clustering and show the dendrogram (default True).
+        annot: write the coefficient in each cell (default True).
+        vmin: lower colour limit; default is the smallest off-diagonal value, rounded down to 0.05.
+        vmax: upper colour limit, default 1.0.
+        cmap: matplotlib colormap name.
+        figsize: figure size.
+        save_path: optional path to save the figure.
+
+    Returns:
+        matplotlib Figure.
+
+    """
+    values = matrix.to_numpy(dtype=float,)
+    off_diag = values[~np.eye(len(matrix,), dtype=bool,)]
+    if vmin is None:
+        finite = off_diag[np.isfinite(off_diag,)]
+        vmin = np.floor((finite.min() if finite.size else 0.0) * 20,) / 20
+
+    n_sites = matrix.attrs.get("n_sites",)
+    full_title = title if n_sites is None else f"{title}\n({n_sites} sites)"
+
+    if cluster and np.isfinite(values,).all() and len(matrix,) > 2:
+        grid = sns.clustermap(matrix,
+                              method="average",
+                              metric="euclidean",
+                              row_linkage=_correlation_linkage(matrix,),
+                              col_linkage=_correlation_linkage(matrix,),
+                              annot=annot,
+                              fmt=".2f",
+                              vmin=vmin,
+                              vmax=vmax,
+                              cmap=cmap,
+                              figsize=figsize,
+                              cbar_kws={"label": "r"},
+                              dendrogram_ratio=0.15,)
+        grid.fig.suptitle(full_title, weight="bold", y=1.02,)
+        fig = grid.fig
+    else:
+        fig, ax = plt.subplots(figsize=figsize,)
+        sns.heatmap(matrix,
+                    annot=annot,
+                    fmt=".2f",
+                    vmin=vmin,
+                    vmax=vmax,
+                    cmap=cmap,
+                    square=True,
+                    cbar_kws={"label": "r"},
+                    ax=ax,)
+        ax.set_title(full_title, weight="bold",)
+        fig.tight_layout()
+    _save_figure(fig,
+                 save_path,)
+    plt.show()
+    return fig
+
+
+def _correlation_linkage(matrix,):
+    """
+    Average-linkage tree on the correlation distance 1 - r.
+
+    Args:
+        matrix: square, complete correlation DataFrame.
+
+    Returns:
+        scipy linkage matrix.
+
+    """
+    from scipy.cluster.hierarchy import linkage
+    dist = 1.0 - matrix.to_numpy(dtype=float,)
+    dist = (dist + dist.T) / 2
+    np.fill_diagonal(dist, 0.0,)
+    condensed = squareform(np.clip(dist, 0.0, None,), checks=False,)
+    return linkage(condensed, method="average",)
+
+
+def plot_correlation_to_reference(global_matrix,
+                                  reference,
+                                  per_site=None,
+                                  calibration=None,
+                                  title=None,
+                                  figsize=(13, 5),
+                                  save_path=None,
+                                  ):
+    """
+    How close each profile is to a reference: global r (bars) and per-site r (distributions).
+
+    Profiles are sorted from most to least similar by the global correlation, and the same order is
+    used in both panels.
+
+    Args:
+        global_matrix: output of global_profile_correlation.
+        reference: name of the reference profile, e.g. "WT".
+        per_site: optional output of per_site_profile_correlation (with reference=reference, or
+            all pairs); draws the right-hand panel of per-site distributions.
+        calibration: optional dict {label: (profile_a, profile_b)} of pairs whose global r is drawn
+            as a dashed horizontal line on the left panel, e.g. {"BRAF duplicate":
+            ("BRAFS151A1", "BRAFS151A2")} — what "same genotype" looks like.
+        title: figure title.
+        figsize: figure size.
+        save_path: optional path to save the figure.
+
+    Returns:
+        Tuple (fig, summary DataFrame with profile, global_r and, if per_site is given,
+        median_site_r, iqr_low, iqr_high, n_sites).
+
+    """
+    others = [n for n in global_matrix.columns if n != reference]
+    summary = pd.DataFrame({"profile": others,
+                            "global_r": [global_matrix.loc[reference, n] for n in others],},)
+
+    site_r = {}
+    if per_site is not None:
+        for n in others:
+            mask = (((per_site["profile_a"] == reference) & (per_site["profile_b"] == n))
+                    | ((per_site["profile_a"] == n) & (per_site["profile_b"] == reference)))
+            site_r[n] = per_site.loc[mask, "r"].dropna().to_numpy()
+        summary["median_site_r"] = [np.median(site_r[n],) if site_r[n].size else np.nan for n in others]
+        summary["iqr_low"] = [np.percentile(site_r[n], 25,) if site_r[n].size else np.nan for n in others]
+        summary["iqr_high"] = [np.percentile(site_r[n], 75,) if site_r[n].size else np.nan for n in others]
+        summary["n_sites"] = [site_r[n].size for n in others]
+    summary = summary.sort_values("global_r", ascending=False,).reset_index(drop=True,)
+    order = list(summary["profile"],)
+
+    n_panels = 2 if per_site is not None else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize if n_panels == 2 else (figsize[0] / 2, figsize[1]),)
+    axes = np.atleast_1d(axes,)
+    colors = sns.color_palette("tab10", n_colors=len(order,),)
+
+    ax = axes[0]
+    ax.bar(order, summary["global_r"], color=colors, edgecolor="white",)
+    for i, v in enumerate(summary["global_r"],):
+        ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8,)
+    if calibration:
+        for j, (label, (a, b)) in enumerate(calibration.items(),):
+            value = global_matrix.loc[a, b]
+            ax.axhline(value, ls="--", color=["black", "grey", "darkred"][j % 3], lw=1,
+                       label=f"{label}: {value:.2f}",)
+        ax.legend(fontsize=8, loc="lower left",)
+    ax.set_ylabel(f"global {global_matrix.attrs.get('method', 'pearson')} r vs {reference}")
+    ax.set_ylim(min(0.0, summary["global_r"].min() - 0.05,), 1.0,)
+    ax.set_title(f"All sites x timepoints flattened\n({global_matrix.attrs.get('n_sites', '?')} sites)",
+                 fontsize=10,)
+    ax.tick_params(axis="x", rotation=45,)
+    ax.grid(axis="y", alpha=0.3,)
+
+    if per_site is not None:
+        ax = axes[1]
+        data = [site_r[n] for n in order]
+        parts = ax.violinplot(data, showmedians=True, showextrema=False,)
+        for body, color in zip(parts["bodies"], colors,):
+            body.set_facecolor(color,)
+            body.set_alpha(0.6,)
+        ax.boxplot(data, widths=0.12, showfliers=False, medianprops={"color": "black"},)
+        ax.axhline(0, color="grey", lw=0.8,)
+        ax.set_xticks(np.arange(1, len(order,) + 1,),)
+        ax.set_xticklabels(order, rotation=45, ha="right",)
+        ax.set_ylabel(f"per-site {per_site.attrs.get('method', '')} r vs {reference}")
+        ax.set_title("Per-site profile correlation (shape, amplitude-free)", fontsize=10,)
+        ax.grid(axis="y", alpha=0.3,)
+
+    fig.suptitle(title or f"Temporal-profile similarity to {reference}", weight="bold",)
+    fig.tight_layout()
+    _save_figure(fig,
+                 save_path,)
+    plt.show()
+    return fig, summary
+
+
+def plot_per_timepoint_correlation(per_tp,
+                                   title="Correlation across sites, per timepoint",
+                                   figsize=(8, 5),
+                                   save_path=None,
+                                   ):
+    """
+    Line plot of per-timepoint correlations, one line per pair.
+
+    Args:
+        per_tp: output of per_timepoint_correlation.
+        title: figure title.
+        figsize: figure size.
+        save_path: optional path to save the figure.
+
+    Returns:
+        matplotlib Figure.
+
+    """
+    order = _order_timepoints(per_tp["timepoint"].unique(),)
+    fig, ax = plt.subplots(figsize=figsize,)
+    for pair, sub in per_tp.groupby("pair", sort=False,):
+        sub = sub.set_index("timepoint",).reindex(order,)
+        ax.plot(order, sub["r"], marker="o", label=pair,)
+    ax.set_xlabel("Timepoint (min, categorical axis)")
+    ax.set_ylabel("r across sites")
+    ax.set_title(f"{title}\n({int(per_tp['n_sites'].iloc[0])} sites)", weight="bold",)
+    ax.grid(alpha=0.3,)
+    ax.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc="upper left",)
+    fig.tight_layout()
+    _save_figure(fig,
+                 save_path,)
+    plt.show()
+    return fig
+
+
+def plot_profile_scatter_grid(profiles,
+                              pairs,
+                              by_timepoint=True,
+                              gridsize=45,
+                              lim=None,
+                              panel_size=2.8,
+                              title="Profile values, pairwise",
+                              save_path=None,
+                              ):
+    """
+    Density scatter (hexbin) of one profile against another, with r annotated.
+
+    Args:
+        profiles: dict {name: sites x timepoints DataFrame}; aligned internally (complete rows only).
+        pairs: list of (x_name, y_name) tuples, one row of panels per pair.
+        by_timepoint: if True (default) one panel per timepoint plus a final "all" panel; if False
+            only the flattened "all" panel per pair (one row of panels, one per pair).
+        gridsize: hexbin grid size.
+        lim: symmetric axis limit; default is the 99.5th percentile of |values|.
+        panel_size: size of each panel in inches.
+        title: figure title.
+        save_path: optional path to save the figure.
+
+    Returns:
+        matplotlib Figure.
+
+    """
+    aligned = align_profiles(profiles,)
+    tps = list(next(iter(aligned.values()),).columns,)
+    if lim is None:
+        all_vals = np.concatenate([m.to_numpy().ravel() for m in aligned.values()],)
+        lim = float(np.nanpercentile(np.abs(all_vals,), 99.5,))
+
+    if by_timepoint:
+        n_rows, n_cols = len(pairs,), len(tps,) + 1
+    else:
+        n_rows, n_cols = 1, len(pairs,)
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(panel_size * n_cols, panel_size * n_rows),
+                             squeeze=False,)
+
+    def _panel(ax, x, y, label,):
+        ax.hexbin(x, y, gridsize=gridsize, bins="log", cmap="Blues", mincnt=1,
+                  extent=(-lim, lim, -lim, lim),)
+        ax.plot([-lim, lim], [-lim, lim], color="grey", lw=0.8, ls="--",)
+        ax.axhline(0, color="lightgrey", lw=0.6,)
+        ax.axvline(0, color="lightgrey", lw=0.6,)
+        r = np.corrcoef(x, y,)[0, 1]
+        ax.text(0.04, 0.96, f"r = {r:.2f}", transform=ax.transAxes, va="top", fontsize=9,
+                bbox={"facecolor": "white", "alpha": 0.8, "lw": 0},)
+        ax.set_xlim(-lim, lim,)
+        ax.set_ylim(-lim, lim,)
+        ax.set_title(label, fontsize=9,)
+
+    for i, (a, b) in enumerate(pairs,):
+        xa, yb = aligned[a], aligned[b]
+        if by_timepoint:
+            for j, tp in enumerate(tps,):
+                _panel(axes[i, j], xa[tp].to_numpy(), yb[tp].to_numpy(), f"{tp} min",)
+            _panel(axes[i, -1], xa.to_numpy().ravel(), yb.to_numpy().ravel(), "all timepoints",)
+            axes[i, 0].set_ylabel(f"{b}", fontsize=9,)
+            for j in range(n_cols,):
+                axes[i, j].set_xlabel(f"{a}", fontsize=8,)
+        else:
+            ax = axes[0, i]
+            _panel(ax, xa.to_numpy().ravel(), yb.to_numpy().ravel(), f"{b} vs {a}",)
+            ax.set_xlabel(a, fontsize=9,)
+            ax.set_ylabel(b, fontsize=9,)
+
+    n_sites = len(next(iter(aligned.values()),),)
+    fig.suptitle(f"{title} ({n_sites} sites; dashed = identity)", weight="bold",)
+    fig.tight_layout()
+    _save_figure(fig,
+                 save_path,)
+    plt.show()
+    return fig
