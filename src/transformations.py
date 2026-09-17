@@ -579,6 +579,133 @@ def log2_step_size(df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# TMT channel-offset correction (random per-channel loading error)
+# ---------------------------------------------------------------------------
+# NOT wired into run_all_transformations — call it on the raw table first, then run the
+# pipeline on its output. Checked on the full hme1_2 table in
+# notebooks/02_qc/TMT_channel_offsets.ipynb before it is adopted.
+
+def correct_channel_offsets(df: pd.DataFrame,
+                            cell_line: str = "WT",
+                            data_type: str = "raw:abs",
+                            conditions: list = ['_EGF_', '_INS_', '_EGFnINS_'],
+                            reference: str = "starve",
+                            keep_systematic: bool = True,
+                            min_common_sites: int = 200,) -> tuple:
+    """
+    Remove the per-channel loading error of a TMT experiment, relative to the reference channel of the same plex.
+
+    Every TMT channel is one sample, and any error in the amount of material that ends up in it
+    (protein assay, pipetting, labelling efficiency, handling) multiplies every peptide of that
+    channel by the same factor. In log2 space that is one constant per channel. It is estimated
+    as the median, over sites, of the within-plex difference to the reference channel:
+
+        offset[c, t, r] = median_sites( log2 x[c, t, r] - log2 x[c, reference, r] )
+
+    and split into two parts:
+
+        systematic[c, t] = mean over replicates of offset[c, t, r]   (same in every plex)
+        random[c, t, r]  = offset[c, t, r] - systematic[c, t]         (differs plex to plex)
+
+    With keep_systematic=True (default) only the random part is removed. That step assumes
+    nothing about biology — replicates of the same condition and timepoint should share their
+    median whatever the biology is — so a genuine global change in phosphorylation survives.
+    keep_systematic=False removes the whole offset, i.e. a median normalisation against the
+    reference channel, which assumes most sites do not change. With a fixed channel layout the
+    systematic part is confounded with the TMT channel, so that choice cannot be made from the
+    phospho data alone.
+
+    Estimation uses only the sites quantified in every selected column ("common" sites), so
+    every plex's offset is computed on the same peptides. Missingness in TMT is plex-wise, and a
+    median over each plex's own detected set would compare different peptide populations. The
+    correction is then applied to EVERY site, including sites seen in fewer plexes: it is one
+    constant per channel and does not depend on which sites were used to estimate it.
+
+    Zeros are treated as missing for the estimation and stay zero in the output (0 / factor = 0);
+    NaN stays NaN. The reference channel is never changed.
+
+    Args:
+        df: DataFrame with {cell_line}_{data_type}_{treatment}_{timepoint}_{replicate} columns on
+            the raw (linear) intensity scale.
+        cell_line: cell line prefix, e.g. 'WT'.
+        data_type: raw intensity data type; must start with 'raw:'.
+        conditions: condition tokens with underscores, e.g. ['_EGF_', '_INS_'].
+        reference: timepoint the offsets are measured against, e.g. 'starve'.
+        keep_systematic: True removes only the plex-to-plex (random) part of each offset;
+            False removes the whole offset.
+        min_common_sites: smallest number of common sites accepted for the estimate.
+
+    Returns:
+        Tuple (corrected_df, offsets):
+            corrected_df  copy of df with the selected raw columns divided by 2**applied. Any
+                          derived columns already present (log2:abs, log2:mean, log2:FC, ...)
+                          are NOT recomputed and are stale — re-run run_all_transformations.
+            offsets       one row per corrected column: condition, timepoint, replicate, column,
+                          n_sites, offset, systematic, random, applied (all in log2 units).
+    """
+    if not data_type.startswith("raw:"):
+        raise ValueError(f"correct_channel_offsets: expects a raw (linear) data_type, got '{data_type}'.")
+
+    groups = parse_columns(df,
+                           cell_lines=[cell_line],
+                           data_type=data_type,
+                           conditions=conditions,
+                           replicates=True,)[cell_line]
+    all_cols = list(dict.fromkeys(col
+                                  for timepoints in groups.values()
+                                  for cols in timepoints.values()
+                                  for col in cols))
+    if not all_cols:
+        raise ValueError(f"correct_channel_offsets: no '{data_type}' replicate columns for '{cell_line}'.")
+
+    values = df[all_cols].astype(float)
+    log2_values = np.log2(values.where(values > 0))       # zeros / negatives -> NaN
+    common = log2_values.notna().all(axis=1).to_numpy()
+    n_common = int(common.sum())
+    if n_common < min_common_sites:
+        raise ValueError(f"correct_channel_offsets: only {n_common} sites are quantified in every column "
+                         f"(min_common_sites={min_common_sites}); the offsets would not be reliable.")
+
+    records = []
+    for condition, timepoints in groups.items():
+        if reference not in timepoints:
+            warnings.warn(f"correct_channel_offsets: no '{reference}' columns for {condition} — skipped.")
+            continue
+        reference_by_rep = {col.split('_')[-1]: col for col in timepoints[reference]}
+        for timepoint, cols in timepoints.items():
+            if timepoint == reference:
+                continue
+            for col in cols:
+                replicate = col.split('_')[-1]
+                if replicate not in reference_by_rep:
+                    warnings.warn(f"correct_channel_offsets: no {reference} column for {col} — skipped.")
+                    continue
+                diff = (log2_values[col].to_numpy()[common]
+                        - log2_values[reference_by_rep[replicate]].to_numpy()[common])
+                records.append({"condition": condition.strip('_'),
+                                "timepoint": timepoint,
+                                "replicate": replicate,
+                                "column": col,
+                                "n_sites": n_common,
+                                "offset": float(np.median(diff)),})
+
+    offsets = pd.DataFrame(records)
+    offsets["systematic"] = offsets.groupby(["condition", "timepoint"])["offset"].transform("mean")
+    offsets["random"] = offsets["offset"] - offsets["systematic"]
+    offsets["applied"] = offsets["random"] if keep_systematic else offsets["offset"]
+
+    stale = [c for c in df.columns if c.startswith(f"{cell_line}_log2:") or c.startswith(f"{cell_line}_raw:mean")]
+    if stale:
+        warnings.warn(f"correct_channel_offsets: {len(stale)} derived columns (e.g. '{stale[0]}') are now stale — "
+                      "re-run run_all_transformations on the corrected raw columns.")
+
+    result = df.copy()
+    factors = 2.0 ** offsets.set_index("column")["applied"]
+    result[factors.index.tolist()] = result[factors.index.tolist()].astype(float) / factors.to_numpy()
+    return result, offsets
+
+
+# ---------------------------------------------------------------------------
 # DEPRECATED — statistics moved to R/limma (2026-08-06)
 # ---------------------------------------------------------------------------
 # compute_pvalues / compute_fdr / compute_log10_fdr are no longer part of the
@@ -1451,6 +1578,353 @@ def run_diapasef_transformations(df: pd.DataFrame,
               f"(+{result.shape[1] - n_before})")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Step size and peak timing — TMT and diaPASEF alike
+# ---------------------------------------------------------------------------
+# `dia_log2_step_size()` is the diaPASEF twin of `log2_step_size()` above (same
+# definition, all cell lines in one pass, exact first-field cell-line matching,
+# one concat instead of column-by-column insertion).
+#
+# `add_peak_timepoints()` is NOT duplicated per platform: it selects its columns
+# through `_enumerate_data_columns()`, which matches the cell line on the exact
+# first field, so it is safe on the 8-cell-line diaPASEF table and behaves
+# identically on the single-cell-line TMT tables.
+# ---------------------------------------------------------------------------
+
+def _enumerate_data_columns(df: pd.DataFrame,
+                            data_type: str,
+                            cell_lines: list = None,
+                            conditions: list = None) -> dict:
+    """
+    Map every non-replicate data column of one data type to cell line, condition and timepoint.
+
+    The cell line and the condition are read from their own fields of the column name rather
+    than matched as substrings, so a name that prefixes another (BRAFS151A1 vs BRAFS151A2)
+    cannot pull in both, and flat annotation columns (`site`, `peak:FC_...`, cluster labels)
+    are ignored because they do not have the four mandatory fields.
+
+    Args:
+        df: DataFrame following the project naming convention.
+        data_type: DataType field to collect, e.g. 'log2:FC' or 'log2:step'.
+        cell_lines: cell-line prefixes to keep; None (default) keeps every one found.
+        conditions: condition names to keep, with or without the surrounding underscores
+            (e.g. 'EGF' or '_EGF_'); None keeps every one found.
+
+    Returns:
+        Nested dict {cell_line: {condition: {timepoint: column name}}}, with the timepoints of
+        each condition in experimental order (full, starve, then ascending minutes).
+    """
+    wanted_conditions = None if conditions is None else [c.strip("_") for c in conditions]
+
+    found: dict = {}
+    for col in df.columns:
+        info = _split_data_column(col)
+        if info is None or info["data_type"] != data_type or info["replicate"]:
+            continue
+        if cell_lines is not None and info["cell_line"] not in cell_lines:
+            continue
+        if wanted_conditions is not None and info["condition"] not in wanted_conditions:
+            continue
+        found.setdefault(info["cell_line"], {}).setdefault(info["condition"], {})[info["timepoint"]] = col
+
+    return {cell_line: {condition: {tp: cols[tp] for tp in _sort_timepoints_numeric(cols.keys())}
+                        for condition, cols in conditions_found.items()}
+            for cell_line, conditions_found in found.items()}
+
+
+def dia_log2_step_size(df: pd.DataFrame,
+                       cell_lines: list = None,
+                       conditions: list = None,
+                       baseline: str = "starve",
+                       exclude_full: bool = True,
+                       verbose: bool = True) -> pd.DataFrame:
+    """
+    Compute the step between consecutive timepoints of the log2:FC profile, for every cell line.
+
+    Same definition as log2_step_size() (the TMT function, left untouched):
+
+        log2:step(t_i) = log2:FC(t_i) − log2:FC(t_{i-1})
+
+    with the baseline timepoint ('starve' by default) as t_0. Where log2:FC measures every
+    timepoint against the same reference — so a site that rises early and stays up keeps a large
+    FC forever — log2:step asks what changed *during that interval*.
+
+    A step column is labelled by the timepoint it arrives at: `..._log2:step_EGF_5` is the change
+    between 2 and 5 min. There is therefore no step column for the baseline itself, nor for
+    'full', which is a separate media control rather than the timepoint preceding starve and is
+    left out of the chain entirely (exclude_full=True). The baseline column is subtracted
+    explicitly rather than assumed to be 0, so the function stays correct against another
+    reference.
+
+    The steps telescope: summing a condition's steps returns its last log2:FC.
+
+    ⚠ The diaPASEF grid {2, 5, 10, 15, 20, 30, 90} is strongly unequal, so a step is an increment
+    *per interval*, not a rate per minute — the 30 → 90 step covers 60 minutes and the 2 → 5 step
+    covers 3. Divide by the interval width if a rate is wanted.
+
+    Missing values propagate: one missing log2:FC blanks TWO step columns (the step into that
+    timepoint and the step out of it). With DIA's per-run missingness this is common, so the
+    verbose report counts the sites with a complete step series per cell line.
+
+    Output column names:
+        {cell_line}_log2:step_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:FC columns (produced by dia_compute_fold_change).
+        cell_lines: cell-line prefixes to process; None (default) auto-detects all of them.
+        conditions: condition names, e.g. ['_EGF_']; None auto-detects.
+        baseline: timepoint used as the first reference of the chain, default 'starve'.
+        exclude_full: if True (default) 'full' is left out of the chain entirely — no step column
+            for it, and it is never used as a previous timepoint.
+        verbose: if True, print the step columns produced and the complete-series counts.
+
+    Returns:
+        Copy of df with the new log2:step columns appended.
+    """
+    groups = _enumerate_data_columns(df, "log2:FC", cell_lines=cell_lines, conditions=conditions)
+    if not groups:
+        warnings.warn("dia_log2_step_size: no log2:FC columns found — nothing to do.")
+        return df.copy()
+
+    step_cols = {}
+    report = []
+
+    for cell_line, conditions_found in groups.items():
+        for condition, tp_cols in conditions_found.items():
+            timepoints = [tp for tp in tp_cols if not (exclude_full and tp == "full")]
+
+            if baseline in timepoints:
+                # The chain always starts at the baseline, whatever its position in the sort order.
+                timepoints = [baseline] + [tp for tp in timepoints if tp != baseline]
+            else:
+                warnings.warn(
+                    f"dia_log2_step_size: baseline timepoint '{baseline}' not found for "
+                    f"'{cell_line}' / '{condition}' — the first available timepoint "
+                    f"('{timepoints[0]}') is used as the chain reference instead and gets no "
+                    f"step column."
+                )
+
+            made = []
+            for previous_tp, timepoint in zip(timepoints[:-1], timepoints[1:]):
+                step_col = f"{cell_line}_log2:step_{condition}_{timepoint}"
+                step_cols[step_col] = df[tp_cols[timepoint]] - df[tp_cols[previous_tp]]
+                made.append(step_col)
+
+            if made:
+                complete = df[[tp_cols[tp] for tp in timepoints]].notna().all(axis=1)
+                report.append({"cell_line": cell_line,
+                               "condition": condition,
+                               "n_steps": len(made),
+                               "n_complete": int(complete.sum()),
+                               "n_sites": len(df),})
+
+    if verbose and report:
+        print(f"log2:step — {len(step_cols)} columns "
+              f"(baseline '{baseline}'{', full excluded' if exclude_full else ''}):")
+        for row in report:
+            print(f"  {row['cell_line']:<14} {row['condition']:<10} {row['n_steps']} steps | "
+                  f"complete series in {row['n_complete']:>7} / {row['n_sites']} sites")
+
+    return pd.concat([df.copy(), pd.DataFrame(step_cols, index=df.index)], axis=1)
+
+
+def dia_compute_wt_fold_change(df: pd.DataFrame,
+                               cell_lines: list = None,
+                               conditions: list = None,
+                               reference_cell_line: str = "WT",
+                               reference: str = "starve",
+                               verbose: bool = True) -> pd.DataFrame:
+    """
+    Compute the log2 fold change of every cell line against the starve of the reference (WT) cell line.
+
+        log2:wtFC(cell line X, t) = log2:mean(X, t) − log2:mean(WT, starve)
+
+    log2:FC compares each cell line with its own starve, so it removes any difference in
+    the baseline between cell lines. log2:wtFC puts every cell line on one common baseline
+    instead, so a mutant whose site is already higher at rest shows that offset at every
+    timepoint:
+      - for WT, log2:wtFC is identical to log2:FC (full and starve included);
+      - for a mutant, log2:wtFC_starve = log2:mean(X, starve) − log2:mean(WT, starve) is the
+        basal difference between X and WT, no longer a structural zero, and
+        log2:wtFC(t) = log2:FC(t) + log2:wtFC_starve.
+
+    Columns are written for every timepoint present, `full` and `starve` included. The
+    reference is matched per condition: X's EGF arm is compared with WT's EGF starve.
+
+    ⚠ log2:wtFC mixes the response with the baseline difference between cell lines, and
+    that difference also contains whatever differs between the cultures and runs (loading,
+    clone, batch) — diaPASEF has no between-cell-line normalisation. Read a mutant's
+    starve column as "basal difference plus technical offset", not as pure biology.
+
+    Missing values: a site with no WT starve has no reference, so every log2:wtFC of that
+    site stays NaN in every cell line (NaN, never 0). A site measured in X but not in WT
+    starve is therefore lost here even if its own log2:FC exists; the counts are reported.
+    The reverse also happens: a mutant site with no starve of its own has no log2:FC but
+    does get a log2:wtFC, as long as WT starve was measured.
+
+    Output column names:
+        {cell_line}_log2:wtFC_{treatment}_{timepoint}
+
+    Args:
+        df: DataFrame with log2:mean columns (produced by run_diapasef_transformations /
+            dia_compute_log2_stats).
+        cell_lines: cell-line prefixes to process, matched on the exact first field; None
+            (default) processes every cell line with log2:mean columns. The reference cell
+            line does not have to be in this list, but its columns must be in df.
+        conditions: condition names, e.g. ['_EGF_'] or ['EGF']; None auto-detects.
+        reference_cell_line: cell line whose baseline is the common reference, default 'WT'.
+        reference: timepoint of the reference cell line used as baseline, default 'starve'.
+        verbose: if True, print per cell line × condition how many sites got a log2:wtFC.
+
+    Returns:
+        Copy of df with the new log2:wtFC columns appended.
+    """
+    groups = _enumerate_data_columns(df, "log2:mean", cell_lines=cell_lines, conditions=conditions)
+    reference_groups = _enumerate_data_columns(df, "log2:mean", cell_lines=[reference_cell_line],
+                                               conditions=conditions)
+    if not groups:
+        warnings.warn("dia_compute_wt_fold_change: no log2:mean columns found — nothing to do.")
+        return df.copy()
+    if reference_cell_line not in reference_groups:
+        raise ValueError(f"dia_compute_wt_fold_change: no log2:mean columns for reference "
+                         f"cell line '{reference_cell_line}'.")
+
+    wt_fc_cols = {}
+    report = []
+
+    for cell_line, conditions_found in groups.items():
+        for condition, tp_cols in conditions_found.items():
+            ref_col = reference_groups[reference_cell_line].get(condition, {}).get(reference)
+            if ref_col is None:
+                warnings.warn(f"dia_compute_wt_fold_change: '{reference_cell_line}_log2:mean_"
+                              f"{condition}_{reference}' not found — skipping log2:wtFC for "
+                              f"{cell_line} / {condition}.")
+                continue
+
+            ref = df[ref_col]
+            for timepoint, mean_col in tp_cols.items():
+                wt_fc_cols[f"{cell_line}_log2:wtFC_{condition}_{timepoint}"] = df[mean_col] - ref
+
+            # Sites that have their own starve (so a log2:FC) but no reference starve: they get
+            # no log2:wtFC, which is the one loss this step adds on top of log2:FC.
+            own_starve = tp_cols.get(reference)
+            measured = df[list(tp_cols.values())].notna().any(axis=1)
+            lost = (df[own_starve].notna() & ref.isna() & measured) if own_starve is not None else ref.isna() & False
+            report.append({"cell_line": cell_line,
+                           "condition": condition,
+                           "n_timepoints": len(tp_cols),
+                           "n_with_wtfc": int((measured & ref.notna()).sum()),
+                           "n_no_reference": int(ref.isna().sum()),
+                           "n_own_starve_lost": int(lost.sum()),
+                           "n_sites": len(df),})
+
+    if verbose and report:
+        print(f"log2:wtFC — {len(wt_fc_cols)} columns, baseline '{reference_cell_line}' / '{reference}':")
+        for row in report:
+            print(f"  {row['cell_line']:<14} {row['condition']:<8} {row['n_timepoints']} tps | "
+                  f"wtFC at >=1 tp: {row['n_with_wtfc']:>6} / {row['n_sites']} | "
+                  f"no {reference_cell_line} {reference}: {row['n_no_reference']:>6} | "
+                  f"own {reference} but no {reference_cell_line} {reference}: {row['n_own_starve_lost']:>6}")
+
+    return pd.concat([df.copy(), pd.DataFrame(wt_fc_cols, index=df.index)], axis=1)
+
+
+def add_peak_timepoints(df: pd.DataFrame,
+                        cell_lines: list = None,
+                        conditions: list = None,
+                        data_types: tuple = ("log2:FC", "log2:step",),
+                        exclude_timepoints: tuple = ("full", "starve",),
+                        verbose: bool = True) -> pd.DataFrame:
+    """
+    Label, per site, the timepoint at which each profile reaches its largest absolute value.
+
+    Two questions, one per data type:
+
+        {cell_line}_peak:FC_{condition}    at which timepoint is |log2:FC| largest?
+                                           — when the site is furthest from its starve baseline
+        {cell_line}_peak:step_{condition}  at which timepoint is |log2:step| largest?
+                                           — during which interval did the site change most
+
+    The comparison is on the ABSOLUTE value, so a downregulated site peaks at its deepest point
+    and the largest negative step counts as a peak. The direction is therefore not recoverable
+    from these columns alone; read the corresponding log2:FC / log2:step value for the sign.
+
+    A step column is named after the timepoint it arrives at, so `peak:step = "5"` means the
+    biggest change happened between the previous timepoint and 5 min, not after 5 min.
+
+    The value stored is the timepoint LABEL as a string ('2', '10', '90'), not a number, and NaN
+    for a site whose whole profile is missing. Ties go to the earliest timepoint. A site with a
+    partially missing profile is scored over the timepoints it does have — the label is the peak
+    of what was measured, which for the sparse DIA sites is not the same claim as the peak of the
+    true profile.
+
+    Note these columns do not carry a timepoint field, so they do not follow the
+    {CellLine}_{DataType}_{Treatment}_{TimePoint} scheme and `ColumnSpec.select()` will not
+    return them — they are flat per-site annotations, like the kinase-prediction columns.
+
+    Args:
+        df: DataFrame with the log2:FC (and, for peak:step, log2:step) columns.
+        cell_lines: cell-line prefixes to process; None (default) auto-detects all of them.
+        conditions: condition names, e.g. ['_EGF_']; None auto-detects.
+        data_types: data types to summarise; the output name replaces 'log2' with 'peak', so
+            ('log2:FC', 'log2:step') gives peak:FC and peak:step. A data type absent from df is
+            skipped with a warning.
+        exclude_timepoints: timepoints never allowed to win, default ('full', 'starve') — 'full'
+            is a media control rather than a response, and log2:FC at 'starve' is identically 0.
+            Step columns never include either, so the setting only affects peak:FC.
+        verbose: if True, print how often each timepoint wins, per cell line and condition.
+
+    Returns:
+        Copy of df with the new peak columns appended.
+    """
+    peak_cols = {}
+    report = []
+
+    for data_type in data_types:
+        groups = _enumerate_data_columns(df, data_type, cell_lines=cell_lines, conditions=conditions)
+        if not groups:
+            warnings.warn(f"add_peak_timepoints: no '{data_type}' columns found — skipped.")
+            continue
+
+        suffix = "peak:" + data_type.split(":")[-1]
+
+        for cell_line, conditions_found in groups.items():
+            for condition, tp_cols in conditions_found.items():
+                timepoints = [tp for tp in tp_cols if tp not in exclude_timepoints]
+                if not timepoints:
+                    warnings.warn(
+                        f"add_peak_timepoints: every timepoint of '{cell_line}' / '{condition}' "
+                        f"is in exclude_timepoints={exclude_timepoints} — skipped."
+                    )
+                    continue
+
+                values = df[[tp_cols[tp] for tp in timepoints]].to_numpy(dtype=float)
+                magnitudes = np.abs(values)
+                missing = np.isnan(magnitudes)
+
+                # -inf for missing so argmax never selects one; ties keep the earliest timepoint.
+                winner = np.argmax(np.where(missing, -np.inf, magnitudes), axis=1)
+                labels = np.array(timepoints, dtype=object)[winner]
+                labels = np.where(missing.all(axis=1), None, labels)
+
+                peak_col = f"{cell_line}_{suffix}_{condition}"
+                peak_cols[peak_col] = pd.Series(labels, index=df.index, dtype=object)
+
+                report.append({"column": peak_col,
+                               "counts": peak_cols[peak_col].value_counts(),
+                               "n_missing": int(peak_cols[peak_col].isna().sum()),
+                               "timepoints": timepoints,})
+
+    if verbose and report:
+        print(f"peak timepoints — {len(peak_cols)} columns:")
+        for row in report:
+            counts = row["counts"]
+            shown = ", ".join(f"{tp}: {counts.get(tp, 0)}" for tp in row["timepoints"])
+            print(f"  {row['column']:<34} {shown} | no data: {row['n_missing']}")
+
+    return pd.concat([df.copy(), pd.DataFrame(peak_cols, index=df.index)], axis=1)
 
 
 #----------------------
